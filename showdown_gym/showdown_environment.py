@@ -9,6 +9,9 @@ from poke_env.player.player import Player
 
 from showdown_gym.base_environment import BaseShowdownEnv
 
+# ----------------------
+# Type chart + utilities
+# ----------------------
 # All keys are lowercase strings
 TYPE_CHART = {
     "normal": {"rock": 0.5, "ghost": 0.0, "steel": 0.5},
@@ -30,33 +33,38 @@ TYPE_CHART = {
     "steel":  {"fire": 0.5, "water": 0.5, "electric": 0.5, "ice": 2.0, "rock": 2.0, "fairy": 2.0, "steel": 0.5},
     "fairy":  {"fire": 0.5, "fighting": 2.0, "poison": 0.5, "dragon": 2.0, "dark": 2.0, "steel": 0.5},
 }
-
 def _type_name(t) -> str:
-        # Accepts poke_env PokemonType (has .name) or plain strings
-        return (t.name if hasattr(t, "name") else str(t)).lower()
+    return (t.name if hasattr(t, "name") else str(t)).lower()
 
 def offensive_multiplier(attacker_types, defender_types) -> float:
-    """Product of effectiveness for all attacker types against all defender types."""
     mult = 1.0
     if not attacker_types or not defender_types:
-        return mult  # neutral if something is unknown
+        return mult
     for atk in attacker_types:
-        a = _type_name(atk)
-        #print("Attack type: " + a)
-        row = TYPE_CHART.get(a, {})
+        row = TYPE_CHART.get(_type_name(atk), {})
         for df in defender_types:
-            d = _type_name(df)
-            #print("Defender type: " + d)
-            #print(row.get(d, 1.0))
-            mult *= row.get(d, 1.0)
+            mult *= row.get(_type_name(df), 1.0)
     return mult
 
 def normalized_offensive_multiplier(attacker_types, defender_types) -> float:
-    """Normalize to [0,1] by dividing by 4 (max is 4x)."""
+    # normalize by max 4x
     return offensive_multiplier(attacker_types, defender_types) / 4.0
 
-class ShowdownEnvironment(BaseShowdownEnv):
 
+# =======================
+# Simplified Environment
+# =======================
+class ShowdownEnvironment(BaseShowdownEnv):
+    """
+    Tiny high-signal observation (12 dims) and spiky reward for truly good outcomes.
+    Observation:
+        [ my_hp, opp_hp, my_rem, opp_rem,
+          my_vs_opp, opp_vs_my,
+          best_eff, best_bp, best_proxy,
+          speed_edge, opp_low_hp_flag, bias ]
+    """
+
+    # ---------- init / info ----------
     def __init__(
         self,
         battle_format: str = "gen9randombattle",
@@ -73,178 +81,74 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
-
-        # Add any additional information you want to include in the info dictionary that is saved in logs
-        # For example, you can add the win status
-
         if self.battle1 is not None:
             agent = self.possible_agents[0]
             info[agent]["win"] = self.battle1.won
-
         return info
 
-    def _observation_size(self) -> int:
-        # See embed_battle for the breakdown. If you tweak features, update this.
-        return 116
-    
-    def stage_mult(self, stage: int) -> float:
+    # ---------- tiny helpers ----------
+    @staticmethod
+    def _stage_mult(stage: int) -> float:
         s = int(stage)
         return (2 + s) / 2.0 if s >= 0 else 2.0 / (2 - s)
 
-    def approx_speed(self, mon):
+    def _approx_speed(self, mon):
         if not mon:
             return 1.0
         base_stats = getattr(mon, "base_stats", {}) or {}
         base_spe = float(base_stats.get("spe", 50.0))
         boosts = getattr(mon, "boosts", {}) or {}
-        mult = self.stage_mult(int(boosts.get("spe", 0)))
+        mult = self._stage_mult(int(boosts.get("spe", 0)))
         return base_spe * mult
 
-    def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        # -----------------------
-        # helpers (safe + generic)
-        # -----------------------
-        N_MOVES = 4
-        MAX_TEAM = 6
-        TYPES = [
-            "normal","fire","water","electric","grass","ice","fighting","poison",
-            "ground","flying","psychic","bug","rock","ghost","dragon","dark","steel","fairy"
-        ]
-        STAT_ORDER = ["atk","def","spa","spd","spe"]
-        STATUS_KEYS = ["brn","psn","tox","par","slp","frz"]
-        WEATHER_KEYS = ["sun", "rain", "sand", "snow", "none"]
-        TERRAIN_KEYS = ["electric", "grassy", "psychic", "misty", "none"]
-
-        def pad(lst, size, fill):
-            return lst + [fill] * max(0, size - len(lst))
-
-        def hp_from_slots(slots):
-            out = []
-            for mon in slots:
-                out.append(float(getattr(mon, "current_hp_fraction", 1.0)) if mon else 1.0)
-            return out
-
-        def remaining_count(team_dict):
-            # count mons with hp > 0 (or not fainted)
-            cnt = 0
-            for mon in team_dict.values():
-                if mon is None:
-                    continue
-                if getattr(mon, "fainted", False):
-                    continue
-                if getattr(mon, "current_hp", 0) <= 0:
-                    continue
+    @staticmethod
+    def _remaining(team_dict) -> int:
+        cnt = 0
+        for mon in team_dict.values():
+            if mon and not getattr(mon, "fainted", False) and getattr(mon, "current_hp", 0) > 0:
                 cnt += 1
-            return cnt
+        return cnt
 
-        def one_hot_types(types):
-            # types can be None/[], a single type, or dual
-            present = set((_type_name(t) for t in (types or []) if t))
-            return [1.0 if t in present else 0.0 for t in TYPES]
-
-        def boosts_vec(mon):
-            # map boost stage [-6..+6] -> [0,1] via (b+6)/12
-            res = []
-            boosts = getattr(mon, "boosts", {}) if mon else {}
-            for k in STAT_ORDER:
-                b = int(boosts.get(k, 0))
-                res.append((b + 6) / 12.0)
-            return res
-
-        def status_onehot(mon):
-            name = getattr(mon, "status", None)
-            name = str(name).lower() if name else None
-            vec = []
-            for s in STATUS_KEYS:
-                vec.append(1.0 if (name == s) else 0.0)
-            return vec
-
-        def side_hazards(side_conditions) -> Dict[str, float]:
-            # Normalize spikes (0..3 -> 0..1), tspikes (0..2 -> 0..1), others bool {0,1}
-            scl = {
-                "stealthrock": 1.0,
-                "spikes": 1/3.0,
-                "toxicspikes": 1/2.0,
-                "stickyweb": 1.0,
-            }
-            result = {k: 0.0 for k in scl}
-            for key in list(scl.keys()):
-                # poke-env uses enums; be robust to both names and raw strings
-                val = 0
-                for sc_key, sc_val in (side_conditions or {}).items():
-                    name = str(getattr(sc_key, "name", sc_key)).lower()
-                    if name == key:
-                        # sc_val may be layer count or True
-                        try:
-                            val = int(sc_val)
-                        except Exception:
-                            val = 1 if sc_val else 0
-                        break
-                result[key] = float(val) * scl[key]
-            return result
-
-        def weather_onehot(battle):
-            w = getattr(battle, "weather", None)
-            wname = str(getattr(w, "name", w)).lower() if w else "none"
-            vec = []
-            for k in WEATHER_KEYS:
-                vec.append(1.0 if (wname == k) else 0.0)
-            return vec
-
-        def terrain_onehot(battle):
-            t = getattr(battle, "terrain", None)
-            tname = str(getattr(t, "name", t)).lower() if t else "none"
-            vec = []
-            for k in TERRAIN_KEYS:
-                vec.append(1.0 if (tname == k) else 0.0)
-            return vec
-
-        def normalized_bp(move):
-            # normalize base power to [0,1] with 150 as a reasonable cap (randbats)
-            if not move:
-                return 0.0
+    @staticmethod
+    def _best_move_stats(avail_moves, opp_types):
+        """Return best effectiveness, best base power, and a crude damage proxy in [0,1]."""
+        best_eff = 0.0
+        best_bp = 0.0
+        best_proxy = 0.0
+        for move in (avail_moves or []):
             bp = float(getattr(move, "base_power", 0.0) or 0.0)
-            return max(0.0, min(bp / 150.0, 1.0))
+            mtype = getattr(move, "type", None)
+            eff = offensive_multiplier([mtype] if mtype else [], opp_types) if opp_types else 1.0
+            # proxy: normalize by 150*4=600 (randbats-friendly)
+            proxy = (bp * eff) / 600.0
+            if eff > best_eff:
+                best_eff = eff
+            if bp > best_bp:
+                best_bp = bp
+            if proxy > best_proxy:
+                best_proxy = proxy
+        # normalize for obs
+        best_eff_norm = min(best_eff / 4.0, 1.0)
+        best_bp_norm = min(best_bp / 150.0, 1.0)
+        best_proxy = max(0.0, min(best_proxy, 1.0))
+        return best_eff_norm, best_bp_norm, best_proxy
 
-        def pp_frac(move):
-            if not move:
-                return 0.0
-            max_pp = float(getattr(move, "max_pp", 0.0) or 0.0)
-            cur_pp = float(getattr(move, "current_pp", 0.0) or 0.0)
-            return 0.0 if max_pp <= 0 else max(0.0, min(cur_pp / max_pp, 1.0))
+    # ---------- observation ----------
+    def _observation_size(self) -> int:
+        return 12
 
-        # -----------------------
-        # assemble slots & basics
-        # -----------------------
-        team_slots = list(battle.team.values())[:6]
-        opp_slots  = list(battle.opponent_team.values())[:6]
-        team_slots = pad(team_slots, MAX_TEAM, None)
-        opp_slots  = pad(opp_slots,  MAX_TEAM, None)
-
-        team_hp = hp_from_slots(team_slots)                  # 6
-        opp_hp  = hp_from_slots(opp_slots)                   # 6
-        team_rem = remaining_count(battle.team) / MAX_TEAM   # 1
-        opp_rem  = remaining_count(battle.opponent_team) / MAX_TEAM  # 1
+    def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
+        MAX_TEAM = 6
 
         my_active  = getattr(battle, "active_pokemon", None)
         opp_active = getattr(battle, "opponent_active_pokemon", None)
 
-        my_types  = one_hot_types(getattr(my_active, "types", []) if my_active else [])
-        opp_types = one_hot_types(getattr(opp_active, "types", []) if opp_active else [])
+        my_hp  = float(getattr(my_active, "current_hp_fraction", 1.0) or 0.0)
+        opp_hp = float(getattr(opp_active, "current_hp_fraction", 1.0) or 0.0)
 
-        my_boosts  = boosts_vec(my_active)
-        opp_boosts = boosts_vec(opp_active)
+        my_rem  = self._remaining(battle.team) / MAX_TEAM
+        opp_rem = self._remaining(battle.opponent_team) / MAX_TEAM
 
-        my_status  = status_onehot(my_active)
-        opp_status = status_onehot(opp_active)
-
-        my_speed  = self.approx_speed(my_active)
-        opp_speed = self.approx_speed(opp_active)
-        speed_edge = 1.0 if my_speed > opp_speed else 0.0
-        # clamp ratio to [0, 3], then /3 to [0,1]
-        speed_ratio = max(0.0, min(my_speed / max(1e-6, opp_speed), 3.0)) / 3.0
-
-        # matchup scalars (current on-field)
         my_vs_opp = normalized_offensive_multiplier(
             getattr(my_active, "types", []) if my_active else [],
             getattr(opp_active, "types", []) if opp_active else []
@@ -254,232 +158,120 @@ class ShowdownEnvironment(BaseShowdownEnv):
             getattr(my_active, "types", []) if my_active else []
         )
 
-        # per-slot multipliers vs opponent active (your whole team’s offensive pressure)
-        def_types = getattr(opp_active, "types", []) if opp_active else []
-        team_multipliers = []
-        for p in team_slots:
-            atk_types = getattr(p, "types", []) if p else []
-            team_multipliers.append(normalized_offensive_multiplier(atk_types, def_types))
-
-        # moves: effectiveness + base power + pp
-        move_effectiveness, move_bps, move_pps = [], [], []
-        avail_moves = getattr(battle, "available_moves", []) or []
-        for move in avail_moves[:N_MOVES]:
-            mtype = getattr(move, "type", None)
-            eff = offensive_multiplier([mtype] if mtype else [], def_types) if def_types else 1.0
-            move_effectiveness.append(float(eff) / 4.0)  # normalize similar to multiplier
-            move_bps.append(normalized_bp(move))
-            move_pps.append(pp_frac(move))
-        move_effectiveness = pad(move_effectiveness, N_MOVES, 0.0)
-        move_bps          = pad(move_bps,          N_MOVES, 0.0)
-        move_pps          = pad(move_pps,          N_MOVES, 0.0)
-
-        # field state: hazards, weather, terrain
-        my_side_haz  = side_hazards(getattr(battle, "side_conditions", {}))
-        opp_side_haz = side_hazards(getattr(battle, "opponent_side_conditions", {}))
-        haz_my  = [my_side_haz[k]  for k in ["stealthrock","spikes","toxicspikes","stickyweb"]]
-        haz_opp = [opp_side_haz[k] for k in ["stealthrock","spikes","toxicspikes","stickyweb"]]
-        weather_vec = weather_onehot(battle)
-        terrain_vec = terrain_onehot(battle)
-
-        # switchability (forced switch, and bench size)
-        forced_to_switch = 1.0 if getattr(battle, "force_switch", False) else 0.0
-        my_bench = max(0, remaining_count(battle.team) - 1) / (MAX_TEAM - 1)  # normalized
-        opp_bench = max(0, remaining_count(battle.opponent_team) - 1) / (MAX_TEAM - 1)
-
-        # -----------------------
-        # final vector (116 dims)
-        # -----------------------
-        final = (
-            team_hp +                             # 6
-            opp_hp +                              # 6 -> 12
-            [team_rem, opp_rem] +                 # 2 -> 14
-            [my_vs_opp, opp_vs_my] +              # 2 -> 16
-            team_multipliers +                    # 6 -> 22
-            move_effectiveness +                  # 4 -> 26
-            move_bps +                            # 4 -> 30
-            move_pps +                            # 4 -> 34
-            my_types +                            # 18 -> 52
-            opp_types +                           # 18 -> 70
-            my_boosts +                           # 5  -> 75
-            opp_boosts +                          # 5  -> 80
-            my_status +                           # 6  -> 86
-            opp_status +                          # 6  -> 92
-            [speed_edge, speed_ratio] +           # 2  -> 94
-            weather_vec +                         # 5  -> 99
-            terrain_vec +                         # 5  -> 104
-            haz_my + haz_opp +                    # 8  -> 112
-            [forced_to_switch, my_bench, opp_bench]  # 3  -> 115
+        best_eff, best_bp, best_proxy = self._best_move_stats(
+            getattr(battle, "available_moves", []) or [],
+            getattr(opp_active, "types", []) if opp_active else []
         )
-        # add a small constant bias term for NN stability (optional)
-        final.append(1.0)                         # 116
 
-        return np.array(final, dtype=np.float32)
+        speed_edge = 1.0 if self._approx_speed(my_active) > self._approx_speed(opp_active) else 0.0
+        opp_low_hp_flag = 1.0 if opp_hp < 0.25 else 0.0
 
+        obs = [
+            my_hp, opp_hp,
+            my_rem, opp_rem,
+            my_vs_opp, opp_vs_my,
+            best_eff, best_bp, best_proxy,
+            speed_edge,
+            opp_low_hp_flag,
+            1.0,  # bias
+        ]
+        return np.array(obs, dtype=np.float32)
+
+    # ---------- reward (sharp & simple) ----------
     def calc_reward(self, battle: AbstractBattle) -> float:
         prior = self._get_prior_battle(battle)
 
-        # --------
-        # HP terms
-        # --------
-        team_hp_now = [mon.current_hp_fraction for mon in battle.team.values()]
-        opp_hp_now  = [mon.current_hp_fraction for mon in battle.opponent_team.values()]
-        # pad to equal length for safe diffs
-        L = max(len(team_hp_now), len(opp_hp_now))
-        team_hp_now = (team_hp_now + [1.0]*(L - len(team_hp_now)))[:L]
-        opp_hp_now  = (opp_hp_now  + [1.0]*(L - len(opp_hp_now)))[:L]
+        def team_hp_sum(team_dict):
+            s = 0.0
+            for mon in team_dict.values():
+                s += float(getattr(mon, "current_hp_fraction", 0.0) or 0.0)
+            return s
 
-        team_hp_prev, opp_hp_prev = [1.0]*L, [1.0]*L
-        if prior is not None:
-            th = [mon.current_hp_fraction for mon in prior.team.values()]
-            oh = [mon.current_hp_fraction for mon in prior.opponent_team.values()]
-            team_hp_prev = (th + [1.0]*(L - len(th)))[:L]
-            opp_hp_prev  = (oh + [1.0]*(L - len(oh)))[:L]
+        # current
+        my_now  = team_hp_sum(battle.team)
+        opp_now = team_hp_sum(battle.opponent_team)
+        my_act  = getattr(battle, "active_pokemon", None)
+        opp_act = getattr(battle, "opponent_active_pokemon", None)
+        opp_types = getattr(opp_act, "types", []) if opp_act else []
+        best_eff_now, best_bp_now, best_proxy_now = self._best_move_stats(
+            getattr(battle, "available_moves", []) or [], opp_types
+        )
+        speed_edge_now = 1.0 if self._approx_speed(my_act) > self._approx_speed(opp_act) else 0.0
 
-        diff_opp = np.array(opp_hp_prev) - np.array(opp_hp_now)   # damage dealt
-        diff_team = np.array(team_hp_prev) - np.array(team_hp_now) # damage taken
+        if prior is None:
+            return -0.003  # tiny step cost at battle start
+
+        # previous snapshot
+        my_prev  = team_hp_sum(prior.team)
+        opp_prev = team_hp_sum(prior.opponent_team)
+        prev_my_act  = getattr(prior, "active_pokemon", None)
+        prev_opp_act = getattr(prior, "opponent_active_pokemon", None)
+        prev_opp_types = getattr(prev_opp_act, "types", []) if prev_opp_act else []
+        _, _, best_proxy_prev = self._best_move_stats(
+            getattr(prior, "available_moves", []) or [], prev_opp_types
+        )
+        speed_edge_prev = 1.0 if self._approx_speed(prev_my_act) > self._approx_speed(prev_opp_act) else 0.0
 
         reward = 0.0
-        reward += float(np.sum(diff_opp))            # + for damaging opponent
-        reward -= float(np.sum(diff_team))           # - for taking damage
 
-        # -------------
-        # KO / fainting
-        # -------------
+        # (1) HP shaping (small)
+        reward += (opp_prev - opp_now)  # damage dealt
+        reward -= (my_prev - my_now)    # damage taken
+
+        # (2) KO / fainting (spiky)
         def faint_count(team_dict):
             cnt = 0
             for mon in team_dict.values():
-                if mon is None:
-                    continue
-                if getattr(mon, "fainted", False) or getattr(mon, "current_hp", 0) <= 0:
+                if mon and (getattr(mon, "fainted", False) or getattr(mon, "current_hp", 0) <= 0):
                     cnt += 1
             return cnt
 
-        if prior is not None:
-            opp_faint_prev = faint_count(prior.opponent_team)
-            opp_faint_now  = faint_count(battle.opponent_team)
-            my_faint_prev  = faint_count(prior.team)
-            my_faint_now   = faint_count(battle.team)
+        my_faints_prev  = faint_count(prior.team)
+        my_faints_now   = faint_count(battle.team)
+        opp_faints_prev = faint_count(prior.opponent_team)
+        opp_faints_now  = faint_count(battle.opponent_team)
 
-            reward += 1.0 * max(0, opp_faint_now - opp_faint_prev)   # reward KOs
-            reward -= 1.0 * max(0, my_faint_now  - my_faint_prev)    # penalize own faints
+        reward += 3.0 * max(0, opp_faints_now - opp_faints_prev)  # KO achieved
+        reward -= 3.0 * max(0, my_faints_now  - my_faints_prev)   # lost a mon
 
-        # --------------
-        # Status changes
-        # --------------
-        def status_award(now_team, prev_team, positive_for_me=True):
-            # +0.2 for each NEW negative status on the opponent; -0.2 for each NEW on me
-            def to_statuses(tdict):
-                st = []
-                for mon in tdict.values():
-                    s = getattr(mon, "status", None)
-                    st.append(str(s).lower() if s else None)
-                return st
-            prev = to_statuses(prev_team) if prev_team is not None else []
-            now  = to_statuses(now_team)
-            prev = (prev + [None]*(len(now)-len(prev)))[:len(now)]
-            delta = 0.0
-            harmful = {"brn","psn","tox","par","slp","frz"}
-            for p, n in zip(prev, now):
-                if (p in (None, "none")) and (n in harmful):
-                    delta += 0.2 if positive_for_me else -0.2
-            return delta
+        # (3) Crossing key HP thresholds for the opponent (first time under 50%, 25%)
+        def first_cross(prev_hp_sum, now_hp_sum, threshold_sum):
+            return 1.0 if (prev_hp_sum >= threshold_sum and now_hp_sum < threshold_sum) else 0.0
 
-        if prior is not None:
-            reward += status_award(battle.opponent_team, prior.opponent_team, True)
-            reward += status_award(battle.team,          prior.team,          False)
+        # Use total opponent HP sum as a proxy for "somebody got into range"
+        # (In 6v6, half = 3.0, quarter = 1.5)
+        reward += 1.0 * first_cross(opp_prev, opp_now, 3.0)   # under 50% team HP
+        reward += 1.5 * first_cross(opp_prev, opp_now, 1.5)   # under 25% team HP
 
-        # ----------------
-        # Hazards changes
-        # ----------------
-        def hazard_scalar(side_conditions):
-            # weight SR=0.3, Spikes layer=0.15 each, TSpikes layer=0.2 each, Web=0.25
-            w = {"stealthrock":0.3, "spikes":0.15, "toxicspikes":0.2, "stickyweb":0.25}
-            total = 0.0
-            for sc_key, sc_val in (side_conditions or {}).items():
-                name = str(getattr(sc_key, "name", sc_key)).lower()
-                if name in w:
-                    try:
-                        layers = int(sc_val)
-                    except Exception:
-                        layers = 1 if sc_val else 0
-                    total += w[name] * layers
-            return total
+        # (4) Creating a kill threat on the active opponent (proxy >= current opp HP fraction)
+        opp_hp_now = float(getattr(opp_act, "current_hp_fraction", 1.0) or 0.0)
+        made_threat = (best_proxy_prev < opp_hp_now) and (best_proxy_now >= opp_hp_now)
+        if made_threat:
+            reward += 0.6
 
-        if prior is not None:
-            opp_haz_prev = hazard_scalar(getattr(prior,  "opponent_side_conditions", {}))
-            opp_haz_now  = hazard_scalar(getattr(battle, "opponent_side_conditions", {}))
-            my_haz_prev  = hazard_scalar(getattr(prior,  "side_conditions", {}))
-            my_haz_now   = hazard_scalar(getattr(battle, "side_conditions", {}))
+        # (5) Speed edge changes
+        if speed_edge_prev == 0.0 and speed_edge_now == 1.0:
+            reward += 0.3
+        elif speed_edge_prev == 1.0 and speed_edge_now == 0.0:
+            reward -= 0.3
 
-            reward += 0.05 * (opp_haz_now - opp_haz_prev)  # more hazards on opp side is good
-            reward += 0.05 * (my_haz_prev - my_haz_now)    # fewer hazards on my side is good
-
-        # ---------------------------
-        # Matchup & speed improvement
-        # ---------------------------
-        def current_matchup(b):
-            my = getattr(b, "active_pokemon", None)
-            op = getattr(b, "opponent_active_pokemon", None)
-            mv = normalized_offensive_multiplier(getattr(my, "types", []) if my else [],
-                                                 getattr(op, "types", []) if op else [])
-            ov = normalized_offensive_multiplier(getattr(op, "types", []) if op else [],
-                                                 getattr(my, "types", []) if my else [])
-            return mv, ov
-
-        def current_speed_edge(b):
-            my = getattr(b, "active_pokemon", None)
-            op = getattr(b, "opponent_active_pokemon", None)
-            return 1.0 if self.approx_speed(my) > self.approx_speed(op) else 0.0
-
-        mv_now, ov_now = current_matchup(battle)
-        if prior is not None:
-            mv_prev, ov_prev = current_matchup(prior)
-            reward += 0.1 * (mv_now - mv_prev)          # improved my pressure
-            reward += 0.1 * (ov_prev - ov_now)          # reduced their pressure
-
-            se_now  = current_speed_edge(battle)
-            se_prev = current_speed_edge(prior)
-            reward += 0.05 * (se_now - se_prev)         # gained/lost speed edge
-
-        # ----------------
-        # Terminal outcome
-        # ----------------
+        # (6) Terminal outcome
         if battle.finished:
-            # strong terminal reward to align with true objective
-            reward += 20.0 if battle.won else -20.0
+            reward += 8.0 if battle.won else -8.0
 
-        # ----------------
-        # Small step cost
-        # ----------------
-        reward -= 0.01
+        # (7) tiny step cost
+        reward -= 0.003
 
-        # clip to a reasonable band
-        return float(np.clip(reward, -20.0, 20.0))
+        return float(np.clip(reward, -12.0, 12.0))
 
 
-########################################
-# DO NOT EDIT THE CODE BELOW THIS LINE #
-########################################
-
-
+# ======================================
+# DO NOT EDIT THE CODE BELOW THIS LINE  #
+# ======================================
 class SingleShowdownWrapper(SingleAgentWrapper):
     """
     A wrapper class for the PokeEnvironment that simplifies the setup of single-agent
     reinforcement learning tasks in a Pokémon battle environment.
-
-    This class initializes the environment with a specified battle format, opponent type,
-    and evaluation mode. It also handles the creation of opponent players and account names
-    for the environment.
-
-    Do NOT edit this class!
-
-    Attributes:
-        battle_format (str): The format of the Pokémon battle (e.g., "gen9randombattle").
-        opponent_type (str): The type of opponent player to use ("simple", "max", "random").
-        evaluation (bool): Whether the environment is in evaluation mode.
-    Raises:
-        ValueError: If an unknown opponent type is provided.
     """
 
     def __init__(
