@@ -9,6 +9,51 @@ from poke_env.player.player import Player
 
 from showdown_gym.base_environment import BaseShowdownEnv
 
+# All keys are lowercase strings
+TYPE_CHART = {
+    "normal": {"rock": 0.5, "ghost": 0.0, "steel": 0.5},
+    "fire":   {"fire": 0.5, "water": 0.5, "grass": 2.0, "ice": 2.0, "bug": 2.0, "rock": 0.5, "dragon": 0.5, "steel": 2.0},
+    "water":  {"fire": 2.0, "water": 0.5, "grass": 0.5, "ground": 2.0, "rock": 2.0, "dragon": 0.5},
+    "electric":{"water": 2.0, "electric": 0.5, "grass": 0.5, "ground": 0.0, "flying": 2.0, "dragon": 0.5},
+    "grass":  {"fire": 0.5, "water": 2.0, "grass": 0.5, "poison": 0.5, "ground": 2.0, "flying": 0.5, "bug": 0.5, "rock": 2.0, "dragon": 0.5, "steel": 0.5},
+    "ice":    {"fire": 0.5, "water": 0.5, "grass": 2.0, "ice": 0.5, "ground": 2.0, "flying": 2.0, "dragon": 2.0, "steel": 0.5},
+    "fighting":{"normal": 2.0, "ice": 2.0, "poison": 0.5, "flying": 0.5, "psychic": 0.5, "bug": 0.5, "rock": 2.0, "ghost": 0.0, "dark": 2.0, "steel": 2.0, "fairy": 0.5},
+    "poison": {"grass": 2.0, "poison": 0.5, "ground": 0.5, "rock": 0.5, "ghost": 0.5, "steel": 0.0, "fairy": 2.0},
+    "ground": {"fire": 2.0, "electric": 2.0, "grass": 0.5, "poison": 2.0, "flying": 0.0, "bug": 0.5, "rock": 2.0, "steel": 2.0},
+    "flying": {"electric": 0.5, "grass": 2.0, "fighting": 2.0, "bug": 2.0, "rock": 0.5, "steel": 0.5},
+    "psychic":{"fighting": 2.0, "poison": 2.0, "psychic": 0.5, "dark": 0.0, "steel": 0.5},
+    "bug":    {"fire": 0.5, "grass": 2.0, "fighting": 0.5, "poison": 0.5, "flying": 0.5, "psychic": 2.0, "ghost": 0.5, "dark": 2.0, "steel": 0.5, "fairy": 0.5},
+    "rock":   {"fire": 2.0, "ice": 2.0, "fighting": 0.5, "ground": 0.5, "flying": 2.0, "bug": 2.0, "steel": 0.5},
+    "ghost":  {"normal": 0.0, "psychic": 2.0, "ghost": 2.0, "dark": 0.5},
+    "dragon": {"dragon": 2.0, "steel": 0.5, "fairy": 0.0},
+    "dark":   {"fighting": 0.5, "psychic": 2.0, "ghost": 2.0, "dark": 0.5, "fairy": 0.5},
+    "steel":  {"fire": 0.5, "water": 0.5, "electric": 0.5, "ice": 2.0, "rock": 2.0, "fairy": 2.0, "steel": 0.5},
+    "fairy":  {"fire": 0.5, "fighting": 2.0, "poison": 0.5, "dragon": 2.0, "dark": 2.0, "steel": 0.5},
+}
+
+def _type_name(t) -> str:
+        # Accepts poke_env PokemonType (has .name) or plain strings
+        return (t.name if hasattr(t, "name") else str(t)).lower()
+
+def offensive_multiplier(attacker_types, defender_types) -> float:
+    """Product of effectiveness for all attacker types against all defender types."""
+    mult = 1.0
+    if not attacker_types or not defender_types:
+        return mult  # neutral if something is unknown
+    for atk in attacker_types:
+        a = _type_name(atk)
+        #print("Attack type: " + a)
+        row = TYPE_CHART.get(a, {})
+        for df in defender_types:
+            d = _type_name(df)
+            #print("Defender type: " + d)
+            #print(row.get(d, 1.0))
+            mult *= row.get(d, 1.0)
+    return mult
+
+def normalized_offensive_multiplier(attacker_types, defender_types) -> float:
+    """Normalize to [0,1] by dividing by 4 (max is 4x)."""
+    return offensive_multiplier(attacker_types, defender_types) / 4.0
 
 class ShowdownEnvironment(BaseShowdownEnv):
 
@@ -39,52 +84,45 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return info
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """
-        Calculates the reward based on the changes in state of the battle.
-
-        You need to implement this method to define how the reward is calculated
-
-        Args:
-            battle (AbstractBattle): The current battle instance containing information
-                about the player's team and the opponent's team from the player's perspective.
-            prior_battle (AbstractBattle): The prior battle instance to compare against.
-        Returns:
-            float: The calculated reward based on the change in state of the battle.
-        """
-
         prior_battle = self._get_prior_battle(battle)
-
         reward = 0.0
 
+        # --- Current health ---
         health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        health_opponent = [mon.current_hp_fraction for mon in battle.opponent_team.values()]
 
-        # If the opponent has less than 6 Pokémon, fill the missing values with 1.0 (fraction of health)
         if len(health_opponent) < len(health_team):
             health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
 
-        prior_health_opponent = []
+        # --- Prior health ---
+        prior_health_team, prior_health_opponent = [], []
         if prior_battle is not None:
+            prior_health_team = [
+                mon.current_hp_fraction for mon in prior_battle.team.values()
+            ]
             prior_health_opponent = [
                 mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
             ]
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
+        # Pad prior lists
+        if len(prior_health_team) < len(health_team):
+            prior_health_team.extend([1.0] * (len(health_team) - len(prior_health_team)))
         if len(prior_health_opponent) < len(health_team):
-            prior_health_opponent.extend(
-                [1.0] * (len(health_team) - len(prior_health_opponent))
-            )
+            prior_health_opponent.extend([1.0] * (len(health_team) - len(prior_health_opponent)))
 
-        diff_health_opponent = np.array(prior_health_opponent) - np.array(
-            health_opponent
-        )
+        # --- Diffs ---
+        diff_health_opponent = np.array(prior_health_opponent) - np.array(health_opponent)
+        diff_health_team = np.array(prior_health_team) - np.array(health_team)
 
-        # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
+        # --- Rewards ---
+        reward += np.sum(diff_health_opponent)   # reward for damaging opponent
+        reward -= np.sum(diff_health_team)       # penalty for losing own HP
+
+        # --- Clip to [-6, +6] ---
+        reward = float(np.clip(reward, -6.0, 6.0))
 
         return reward
+
 
     def _observation_size(self) -> int:
         """
@@ -99,46 +137,67 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         # Simply change this number to the number of features you want to include in the observation from embed_battle.
         # If you find a way to automate this, please let me know!
-        return 12
+        return 22
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        """
-        Embeds the current state of a Pokémon battle into a numerical vector representation.
-        This method generates a feature vector that represents the current state of the battle,
-        this is used by the agent to make decisions.
+        N_MOVES = 4
 
-        You need to implement this method to define how the battle state is represented.
+        def pad(lst, size, fill):
+            return lst + [fill] * max(0, size - len(lst))
 
-        Args:
-            battle (AbstractBattle): The current battle instance containing information about
-                the player's team and the opponent's team.
-        Returns:
-            np.float32: A 1D numpy array containing the state you want the agent to observe.
-        """
+        # --- slots from the already-ordered dicts (preserve order) ---
+        team_slots = list(battle.team.values())[:6]
+        opp_slots  = list(battle.opponent_team.values())[:6]
+        team_slots = pad(team_slots, 6, None)
+        opp_slots  = pad(opp_slots, 6, None)
 
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        # --- HP blocks in the SAME order as the dicts ---
+        def hp_from_slots(slots):
+            hp = []
+            for mon in slots:
+                if mon is None:
+                    hp.append(1.0)  # keep your convention; switch to 0.0 if you prefer
+                else:
+                    hp.append(float(getattr(mon, "current_hp_fraction", 0.0)))
+            return hp
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+        team_hp = hp_from_slots(team_slots)   # length 6, aligned to dict order
+        opp_hp  = hp_from_slots(opp_slots)    # length 6
 
-        #########################################################################################################
-        # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
-        #########################################################################################################
+        # --- opponent defensive types (for multipliers/effectiveness) ---
+        opp_active = getattr(battle, "opponent_active_pokemon", None)
+        def_types  = (opp_active.types or []) if opp_active else []
 
-        # Final vector - single array with health of both teams
-        final_vector = np.concatenate(
-            [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
-            ]
+        # --- per-slot multipliers (length 6) in SAME order as team_hp ---
+        def slot_multiplier(pkmn, def_types):
+            if not pkmn or not def_types:
+                return 0.0
+            atk_types = pkmn.types or []
+            return normalized_offensive_multiplier(atk_types, def_types)
+
+        team_multipliers = [slot_multiplier(p, def_types) for p in team_slots]
+
+        # --- move effectiveness (not damage) for current active (length 4) ---
+        move_effectiveness = []
+        active = getattr(battle, "active_pokemon", None)
+        if active and opp_active and def_types:
+            for move in getattr(battle, "available_moves", []):
+                mtype = getattr(move, "type", None)
+                eff = offensive_multiplier([mtype] if mtype else [], def_types)
+                move_effectiveness.append(float(eff))
+        move_effectiveness = pad(move_effectiveness, N_MOVES, 0.0)
+
+        # --- final vector: team_hp (6) + opp_hp (6) + team_multipliers (6) + move_eff (4) ---
+        final_vector = np.array(
+            team_hp + opp_hp + team_multipliers + move_effectiveness,
+            dtype=np.float32,
         )
 
-        return final_vector
+        # pretty-print: 6 columns
+        # for i in range(0, final_vector.size, 6):
+        #     print(" ".join(f"{x:.6g}" for x in final_vector[i:i+6]))
 
+        return final_vector
 
 ########################################
 # DO NOT EDIT THE CODE BELOW THIS LINE #
