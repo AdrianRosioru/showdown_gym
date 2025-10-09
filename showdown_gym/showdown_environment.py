@@ -114,6 +114,39 @@ class ShowdownEnvironment(BaseShowdownEnv):
             account_name_two=account_name_two,
             team=team,
         )
+    
+    def _get_action_size(self) -> int | None:
+        """
+        None just uses the default number of actions as laid out in process_action - 26 actions.
+
+        This defines the size of the action space for the agent - e.g. the output of the RL agent.
+
+        This should return the number of actions you wish to use if not using the default action scheme.
+        """
+        return 10  # Return None if action size is default
+
+    def process_action(self, action: np.int64) -> np.int64:
+        """
+        Returns the np.int64 relative to the given action.
+
+        The action mapping is as follows:
+        action = -2: default
+        action = -1: forfeit
+        0 <= action <= 5: switch
+        6 <= action <= 9: move
+        10 <= action <= 13: move and mega evolve
+        14 <= action <= 17: move and z-move
+        18 <= action <= 21: move and dynamax
+        22 <= action <= 25: move and terastallize
+
+        :param action: The action to take.
+        :type action: int64
+
+        :return: The battle order ID for the given action in context of the current battle.
+        :rtype: np.Int64
+        """
+        #print(action)
+        return action
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
@@ -237,14 +270,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 vec = vec[: self._observation_size()]
         return vec
 
-    # ---------- reward (positive-only) ----------
     def calc_reward(self, battle: AbstractBattle) -> float:
         """Purely positive shaping:
-           + damage dealt
-           + took the highest-efficiency move (if we can infer)
+           + damage dealt (scaled & clipped)
+           + took the highest-efficiency move (ties OK; tiny extra if STAB)
            + switched out of low-eff and improved matchup
            + enemy KO
-           + terminal bonus for # of my Pokémon alive
+           + terminal bonus for # of my Pokémon alive (+ small HP-advantage)
         """
         try:
             prior = self._get_prior_battle(battle)
@@ -272,44 +304,46 @@ class ShowdownEnvironment(BaseShowdownEnv):
             for mv in (moves_list or [])[:4]:
                 mtype = getattr(mv, "type", None)
                 eff = type_effectiveness_single(mtype, opp_types) if opp_types else 1.0
-                # include STAB as a tie-breaker by nudging eff a tiny bit
                 if is_stab(mtype, my_types):
-                    eff *= 1.01
+                    eff *= 1.01  # nudge ties toward STAB
                 best = max(best, eff)
             return best  # raw (0..4*1.01)
 
-        def last_my_move_type(b: AbstractBattle):
-            # Try a couple of likely attributes, fall back to None
+        def last_my_move(b: AbstractBattle):
+            # Return (type, is_stab) if we can infer; else (None, False)
             try:
                 mv = getattr(b, "last_move", None)
                 if mv and getattr(mv, "type", None):
-                    return mv.type
+                    ap = getattr(b, "active_pokemon", None)
+                    my_types = getattr(ap, "types", []) if ap else []
+                    return mv.type, is_stab(mv.type, my_types)
             except Exception:
                 pass
             try:
                 ap = getattr(b, "active_pokemon", None)
                 mv = getattr(ap, "last_move_used", None)
                 if mv and getattr(mv, "type", None):
-                    return mv.type
+                    my_types = getattr(ap, "types", []) if ap else []
+                    return mv.type, is_stab(mv.type, my_types)
             except Exception:
                 pass
-            return None
+            return None, False
 
         # current snapshot
         my_now  = team_hp_sum(battle.team)
         opp_now = team_hp_sum(battle.opponent_team)
 
         if prior is None:
-            return 0.0  # no negatives: just start from 0
+            return 0.0  # start from zero, positive-only
 
         my_prev  = team_hp_sum(prior.team)
         opp_prev = team_hp_sum(prior.opponent_team)
 
         reward = 0.0
 
-        # (1) Damage dealt (dense, positive)
-        dmg_dealt = max(0.0, opp_prev - opp_now)  # in [0..6]
-        reward += 1.0 * float(dmg_dealt)          # scale 1.0 is simple; tune if needed
+        # (1) Damage dealt (dense, positive, stabilized)
+        dmg_dealt = max(0.0, opp_prev - opp_now)       # ∈ [0..6]
+        reward += 0.5 * float(min(dmg_dealt, 1.0))     # cap per-step contribution at 0.5
 
         # (2) KO bonus (spiky, positive)
         opp_faints_prev = faint_count(prior.opponent_team)
@@ -317,24 +351,26 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if opp_faints_now > opp_faints_prev:
             reward += 2.0 * (opp_faints_now - opp_faints_prev)
 
-        # (3) Highest-eff move picked (if we can infer)
-        # Compute "best eff" from PRIOR step's available moves vs PRIOR opp active.
+        # (3) Highest-eff move picked (ties OK; tiny STAB boost; non-immune nudge)
         prev_opp_act = getattr(prior, "opponent_active_pokemon", None)
         prev_my_act  = getattr(prior, "active_pokemon", None)
         prev_opp_types = getattr(prev_opp_act, "types", []) if prev_opp_act else []
         prev_my_types  = getattr(prev_my_act, "types", []) if prev_my_act else []
         prev_moves = getattr(prior, "available_moves", []) or []
-
         best_eff_prev = best_eff_against(prev_opp_types, prev_moves, prev_my_types)  # raw
-        mvtype = last_my_move_type(battle)  # try to get the actual last used move
-        if mvtype is not None and prev_opp_types:
-            used_eff = type_effectiveness_single(mvtype, prev_opp_types)
-            # reward if we were within epsilon of best (accounts for STAB nudging)
+
+        used_type, used_was_stab = last_my_move(battle)
+        if used_type is not None and prev_opp_types:
+            used_eff = type_effectiveness_single(used_type, prev_opp_types)
             if used_eff >= best_eff_prev - 1e-6:
                 reward += 0.2
+                if used_was_stab:
+                    reward += 0.05
+            # tiny positive for not hitting an immunity
+            if used_eff > 0.0:
+                reward += 0.05
 
-        # (4) Smart switch when efficiencies were low
-        # If I switched (active mon changed), and prior best eff was low, and now matchup improved.
+        # (4) Smart switch when efficiencies were low (slightly gentler threshold)
         now_my_act  = getattr(battle, "active_pokemon", None)
         now_opp_act = getattr(battle, "opponent_active_pokemon", None)
         switched = (prev_my_act is not None) and (now_my_act is not None) and (prev_my_act is not now_my_act)
@@ -343,15 +379,23 @@ class ShowdownEnvironment(BaseShowdownEnv):
             now_opp_types = getattr(now_opp_act, "types", []) if now_opp_act else []
             prev_best_norm = min(best_eff_prev / 4.0, 1.0) if best_eff_prev > 0 else 0.0
             now_matchup = normalized_matchup_beststab(now_my_types, now_opp_types)
-            if prev_best_norm < 0.5 and now_matchup > prev_best_norm + 0.25:
+            if prev_best_norm < 0.5 and now_matchup > prev_best_norm + 0.20:
                 reward += 0.3
 
-        # (5) Terminal bonus for my Pokémon alive (no negatives)
+        # (5) Terminal positive bonuses
         if battle.finished:
-            my_alive = alive_count(battle.team)
-            reward += 0.5 * my_alive  # up to +3.0 if you 6-0
+            # alive bonus
+            my_alive = sum(
+                1 for m in battle.team.values()
+                if m and not getattr(m, "fainted", False) and getattr(m, "current_hp", 0) > 0
+            )
+            reward += 0.5 * my_alive  # up to +3.0
 
-        # Strictly positive shaping (no penalties)
+            # slight HP-advantage bonus (positive-only)
+            hp_margin = max(0.0, my_now - opp_now)     # only reward if ahead
+            reward += 0.2 * float(hp_margin)           # up to +1.2 if you finish very healthy
+
+        # strictly non-negative and stable decimals
         return max(0.0, round(reward, 3))
 
 
