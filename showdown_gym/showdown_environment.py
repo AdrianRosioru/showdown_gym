@@ -1,8 +1,14 @@
 import os
-from typing import Any, Dict
+import time
+from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
-from poke_env import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
+from poke_env import (
+    AccountConfiguration,
+    MaxBasePowerPlayer,
+    RandomPlayer,
+    SimpleHeuristicsPlayer,
+)
 from poke_env.battle import AbstractBattle
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.player.player import Player
@@ -10,9 +16,8 @@ from poke_env.player.player import Player
 from showdown_gym.base_environment import BaseShowdownEnv
 
 # ----------------------
-# Type chart + utilities
+# Type chart + helpers
 # ----------------------
-# All keys are lowercase strings
 TYPE_CHART = {
     "normal": {"rock": 0.5, "ghost": 0.0, "steel": 0.5},
     "fire":   {"fire": 0.5, "water": 0.5, "grass": 2.0, "ice": 2.0, "bug": 2.0, "rock": 0.5, "dragon": 0.5, "steel": 2.0},
@@ -33,35 +38,66 @@ TYPE_CHART = {
     "steel":  {"fire": 0.5, "water": 0.5, "electric": 0.5, "ice": 2.0, "rock": 2.0, "fairy": 2.0, "steel": 0.5},
     "fairy":  {"fire": 0.5, "fighting": 2.0, "poison": 0.5, "dragon": 2.0, "dark": 2.0, "steel": 0.5},
 }
+
 def _type_name(t) -> str:
     return (t.name if hasattr(t, "name") else str(t)).lower()
 
-def offensive_multiplier(attacker_types, defender_types) -> float:
+def type_effectiveness_single(atk_type, defender_types: Iterable) -> float:
+    """Effectiveness of a single attack type against up to two defender types."""
+    if not atk_type or not defender_types:
+        return 1.0
+    row = TYPE_CHART.get(_type_name(atk_type), {})
     mult = 1.0
+    for df in defender_types:
+        mult *= row.get(_type_name(df), 1.0)
+    return mult  # ∈ {0, 0.25, 0.5, 1, 2, 4}
+
+def normalized_matchup_beststab(attacker_types, defender_types) -> float:
+    """Best single-type (STAB-like) matchup proxy ∈ [0,1]."""
     if not attacker_types or not defender_types:
-        return mult
+        return 0.5
+    best = 0.0
     for atk in attacker_types:
-        row = TYPE_CHART.get(_type_name(atk), {})
-        for df in defender_types:
-            mult *= row.get(_type_name(df), 1.0)
-    return mult
+        best = max(best, type_effectiveness_single(atk, defender_types))
+    return min(best / 4.0, 1.0)
 
-def normalized_offensive_multiplier(attacker_types, defender_types) -> float:
-    # normalize by max 4x
-    return offensive_multiplier(attacker_types, defender_types) / 4.0
+def is_stab(move_type, my_types) -> bool:
+    if not move_type or not my_types:
+        return False
+    mt = _type_name(move_type)
+    return any(mt == _type_name(t) for t in my_types)
 
+def hazard_scalar(side_conditions) -> float:
+    """Tiny compressed hazard scalar ∈ [0,1] (roughly).
+    SR=0.3, Spikes=0.15/layer, TSpikes=0.2/layer, Web=0.25.
+    """
+    weights = {"stealthrock": 0.3, "spikes": 0.15, "toxicspikes": 0.2, "stickyweb": 0.25}
+    total = 0.0
+    for sc_key, sc_val in (side_conditions or {}).items():
+        name = str(getattr(sc_key, "name", sc_key)).lower()
+        if name in weights:
+            try:
+                layers = int(sc_val)
+            except Exception:
+                layers = 1 if sc_val else 0
+            total += weights[name] * layers
+    return float(np.clip(total, 0.0, 1.0))
 
 # =======================
-# Simplified Environment
+# Focused-30 Environment
 # =======================
 class ShowdownEnvironment(BaseShowdownEnv):
     """
-    Tiny high-signal observation (12 dims) and spiky reward for truly good outcomes.
-    Observation:
-        [ my_hp, opp_hp, my_rem, opp_rem,
-          my_vs_opp, opp_vs_my,
-          best_eff, best_bp, best_proxy,
-          speed_edge, opp_low_hp_flag, bias ]
+    Observation (30 dims exactly):
+      team_hp[6], opp_hp[6],                               # 12
+      matchup_my_to_opp, matchup_opp_to_my,               # 2  -> 14
+      move_eff[4], move_immune[4],                        # 8  -> 22
+      best_proxy,                                         # 1  -> 23
+      speed_edge, speed_ratio,                            # 2  -> 25
+      dmg_dealt_last, dmg_taken_last,                     # 2  -> 27
+      opp_low_hp_flag,                                    # 1  -> 28
+      my_haz_scalar, opp_haz_scalar                       # 2  -> 30
+    (No bias term to keep 30.)
     """
 
     # ---------- init / info ----------
@@ -86,7 +122,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             info[agent]["win"] = self.battle1.won
         return info
 
-    # ---------- tiny helpers ----------
+    # ---------- helpers ----------
     @staticmethod
     def _stage_mult(stage: int) -> float:
         s = int(stage)
@@ -102,172 +138,227 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return base_spe * mult
 
     @staticmethod
-    def _remaining(team_dict) -> int:
-        cnt = 0
+    def _team_hp_list(team_dict):
+        hp = []
         for mon in team_dict.values():
-            if mon and not getattr(mon, "fainted", False) and getattr(mon, "current_hp", 0) > 0:
-                cnt += 1
-        return cnt
+            hp.append(float(getattr(mon, "current_hp_fraction", 1.0) or 0.0) if mon else 1.0)
+        hp = hp[:6]
+        if len(hp) < 6:
+            hp = hp + [1.0] * (6 - len(hp))
+        return hp
 
     @staticmethod
-    def _best_move_stats(avail_moves, opp_types):
-        """Return best effectiveness, best base power, and a crude damage proxy in [0,1]."""
-        best_eff = 0.0
-        best_bp = 0.0
+    def _team_hp_sum(team_dict):
+        return sum(float(getattr(mon, "current_hp_fraction", 0.0) or 0.0) for mon in team_dict.values())
+
+    @staticmethod
+    def _best_move_features(avail_moves, opp_types, my_types):
+        """Returns (eff[4], immune[4], best_proxy[0..1]).
+        best_proxy incorporates STAB and is normalized by 150*4*1.5=900.
+        """
+        effs, immunes = [], []
         best_proxy = 0.0
-        for move in (avail_moves or []):
+        for move in (avail_moves or [])[:4]:
             bp = float(getattr(move, "base_power", 0.0) or 0.0)
             mtype = getattr(move, "type", None)
-            eff = offensive_multiplier([mtype] if mtype else [], opp_types) if opp_types else 1.0
-            # proxy: normalize by 150*4=600 (randbats-friendly)
-            proxy = (bp * eff) / 600.0
-            if eff > best_eff:
-                best_eff = eff
-            if bp > best_bp:
-                best_bp = bp
-            if proxy > best_proxy:
-                best_proxy = proxy
-        # normalize for obs
-        best_eff_norm = min(best_eff / 4.0, 1.0)
-        best_bp_norm = min(best_bp / 150.0, 1.0)
-        best_proxy = max(0.0, min(best_proxy, 1.0))
-        return best_eff_norm, best_bp_norm, best_proxy
+            eff_raw = type_effectiveness_single(mtype, opp_types) if opp_types else 1.0
+            stab = 1.5 if is_stab(mtype, my_types) else 1.0
+            effs.append(min(eff_raw / 4.0, 1.0))
+            immunes.append(1.0 if eff_raw == 0.0 else 0.0)
+            best_proxy = max(best_proxy, (bp * eff_raw * stab) / 900.0)
+        while len(effs) < 4:
+            effs.append(0.0); immunes.append(0.0)
+        return effs, immunes, max(0.0, min(best_proxy, 1.0))
 
     # ---------- observation ----------
     def _observation_size(self) -> int:
-        return 12
+        return 30
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        MAX_TEAM = 6
+        team_hp = self._team_hp_list(battle.team)          # 6
+        opp_hp  = self._team_hp_list(battle.opponent_team) # 6
 
-        my_active  = getattr(battle, "active_pokemon", None)
-        opp_active = getattr(battle, "opponent_active_pokemon", None)
-
-        my_hp  = float(getattr(my_active, "current_hp_fraction", 1.0) or 0.0)
-        opp_hp = float(getattr(opp_active, "current_hp_fraction", 1.0) or 0.0)
-
-        my_rem  = self._remaining(battle.team) / MAX_TEAM
-        opp_rem = self._remaining(battle.opponent_team) / MAX_TEAM
-
-        my_vs_opp = normalized_offensive_multiplier(
-            getattr(my_active, "types", []) if my_active else [],
-            getattr(opp_active, "types", []) if opp_active else []
-        )
-        opp_vs_my = normalized_offensive_multiplier(
-            getattr(opp_active, "types", []) if opp_active else [],
-            getattr(my_active, "types", []) if my_active else []
-        )
-
-        best_eff, best_bp, best_proxy = self._best_move_stats(
-            getattr(battle, "available_moves", []) or [],
-            getattr(opp_active, "types", []) if opp_active else []
-        )
-
-        speed_edge = 1.0 if self._approx_speed(my_active) > self._approx_speed(opp_active) else 0.0
-        opp_low_hp_flag = 1.0 if opp_hp < 0.25 else 0.0
-
-        obs = [
-            my_hp, opp_hp,
-            my_rem, opp_rem,
-            my_vs_opp, opp_vs_my,
-            best_eff, best_bp, best_proxy,
-            speed_edge,
-            opp_low_hp_flag,
-            1.0,  # bias
-        ]
-        return np.array(obs, dtype=np.float32)
-
-    # ---------- reward (sharp & simple) ----------
-    def calc_reward(self, battle: AbstractBattle) -> float:
-        prior = self._get_prior_battle(battle)
-
-        def team_hp_sum(team_dict):
-            s = 0.0
-            for mon in team_dict.values():
-                s += float(getattr(mon, "current_hp_fraction", 0.0) or 0.0)
-            return s
-
-        # current
-        my_now  = team_hp_sum(battle.team)
-        opp_now = team_hp_sum(battle.opponent_team)
         my_act  = getattr(battle, "active_pokemon", None)
         opp_act = getattr(battle, "opponent_active_pokemon", None)
+        my_types  = getattr(my_act, "types", []) if my_act else []
         opp_types = getattr(opp_act, "types", []) if opp_act else []
-        best_eff_now, best_bp_now, best_proxy_now = self._best_move_stats(
-            getattr(battle, "available_moves", []) or [], opp_types
+
+        matchup_my_to_opp = normalized_matchup_beststab(my_types, opp_types)
+        matchup_opp_to_my = normalized_matchup_beststab(opp_types, my_types)
+
+        effs, immunes, best_proxy = self._best_move_features(
+            getattr(battle, "available_moves", []) or [], opp_types, my_types
         )
-        speed_edge_now = 1.0 if self._approx_speed(my_act) > self._approx_speed(opp_act) else 0.0
+
+        # damage last step
+        try:
+            prior = self._get_prior_battle(battle)
+        except AttributeError:
+            prior = None
+        my_now_sum  = self._team_hp_sum(battle.team)
+        opp_now_sum = self._team_hp_sum(battle.opponent_team)
+        if prior is None:
+            dmg_dealt_last = 0.0; dmg_taken_last = 0.0
+        else:
+            my_prev_sum  = self._team_hp_sum(prior.team)
+            opp_prev_sum = self._team_hp_sum(prior.opponent_team)
+            dmg_dealt_last = max(0.0, opp_prev_sum - opp_now_sum)
+            dmg_taken_last = max(0.0, my_prev_sum  - my_now_sum)
+
+        # speed features
+        my_speed  = self._approx_speed(my_act)
+        opp_speed = self._approx_speed(opp_act)
+        speed_edge  = 1.0 if my_speed > opp_speed else 0.0
+        speed_ratio = max(0.0, min(my_speed / max(1e-6, opp_speed), 3.0)) / 3.0
+
+        # low-HP flag
+        opp_low_hp_flag = 1.0 if float(getattr(opp_act, "current_hp_fraction", 1.0) or 0.0) < 0.25 else 0.0
+
+        # hazards compressed
+        my_haz  = hazard_scalar(getattr(battle, "side_conditions", {}))
+        opp_haz = hazard_scalar(getattr(battle, "opponent_side_conditions", {}))
+
+        obs = (
+            team_hp + opp_hp +
+            [matchup_my_to_opp, matchup_opp_to_my] +
+            effs + immunes +
+            [best_proxy] +
+            [speed_edge, speed_ratio] +
+            [dmg_dealt_last, dmg_taken_last] +
+            [opp_low_hp_flag] +
+            [my_haz, opp_haz]
+        )
+        vec = np.array(obs, dtype=np.float32)
+        # safety
+        if vec.size != self._observation_size():
+            if vec.size < self._observation_size():
+                vec = np.pad(vec, (0, self._observation_size() - vec.size))
+            else:
+                vec = vec[: self._observation_size()]
+        return vec
+
+    # ---------- reward (positive-only) ----------
+    def calc_reward(self, battle: AbstractBattle) -> float:
+        """Purely positive shaping:
+           + damage dealt
+           + took the highest-efficiency move (if we can infer)
+           + switched out of low-eff and improved matchup
+           + enemy KO
+           + terminal bonus for # of my Pokémon alive
+        """
+        try:
+            prior = self._get_prior_battle(battle)
+        except AttributeError:
+            prior = None
+
+        # short-hands
+        def team_hp_sum(team_dict):
+            return sum(float(getattr(mon, "current_hp_fraction", 0.0) or 0.0) for mon in team_dict.values())
+
+        def faint_count(team_dict):
+            return sum(
+                1 for mon in team_dict.values()
+                if mon and (getattr(mon, "fainted", False) or getattr(mon, "current_hp", 0) <= 0)
+            )
+
+        def alive_count(team_dict):
+            return sum(
+                1 for mon in team_dict.values()
+                if mon and not getattr(mon, "fainted", False) and getattr(mon, "current_hp", 0) > 0
+            )
+
+        def best_eff_against(opp_types, moves_list, my_types) -> float:
+            best = 0.0
+            for mv in (moves_list or [])[:4]:
+                mtype = getattr(mv, "type", None)
+                eff = type_effectiveness_single(mtype, opp_types) if opp_types else 1.0
+                # include STAB as a tie-breaker by nudging eff a tiny bit
+                if is_stab(mtype, my_types):
+                    eff *= 1.01
+                best = max(best, eff)
+            return best  # raw (0..4*1.01)
+
+        def last_my_move_type(b: AbstractBattle):
+            # Try a couple of likely attributes, fall back to None
+            try:
+                mv = getattr(b, "last_move", None)
+                if mv and getattr(mv, "type", None):
+                    return mv.type
+            except Exception:
+                pass
+            try:
+                ap = getattr(b, "active_pokemon", None)
+                mv = getattr(ap, "last_move_used", None)
+                if mv and getattr(mv, "type", None):
+                    return mv.type
+            except Exception:
+                pass
+            return None
+
+        # current snapshot
+        my_now  = team_hp_sum(battle.team)
+        opp_now = team_hp_sum(battle.opponent_team)
 
         if prior is None:
-            return -0.003  # tiny step cost at battle start
+            return 0.0  # no negatives: just start from 0
 
-        # previous snapshot
         my_prev  = team_hp_sum(prior.team)
         opp_prev = team_hp_sum(prior.opponent_team)
-        prev_my_act  = getattr(prior, "active_pokemon", None)
-        prev_opp_act = getattr(prior, "opponent_active_pokemon", None)
-        prev_opp_types = getattr(prev_opp_act, "types", []) if prev_opp_act else []
-        _, _, best_proxy_prev = self._best_move_stats(
-            getattr(prior, "available_moves", []) or [], prev_opp_types
-        )
-        speed_edge_prev = 1.0 if self._approx_speed(prev_my_act) > self._approx_speed(prev_opp_act) else 0.0
 
         reward = 0.0
 
-        # (1) HP shaping (small)
-        reward += (opp_prev - opp_now)  # damage dealt
-        reward -= (my_prev - my_now)    # damage taken
+        # (1) Damage dealt (dense, positive)
+        dmg_dealt = max(0.0, opp_prev - opp_now)  # in [0..6]
+        reward += 1.0 * float(dmg_dealt)          # scale 1.0 is simple; tune if needed
 
-        # (2) KO / fainting (spiky)
-        def faint_count(team_dict):
-            cnt = 0
-            for mon in team_dict.values():
-                if mon and (getattr(mon, "fainted", False) or getattr(mon, "current_hp", 0) <= 0):
-                    cnt += 1
-            return cnt
-
-        my_faints_prev  = faint_count(prior.team)
-        my_faints_now   = faint_count(battle.team)
+        # (2) KO bonus (spiky, positive)
         opp_faints_prev = faint_count(prior.opponent_team)
         opp_faints_now  = faint_count(battle.opponent_team)
+        if opp_faints_now > opp_faints_prev:
+            reward += 2.0 * (opp_faints_now - opp_faints_prev)
 
-        reward += 3.0 * max(0, opp_faints_now - opp_faints_prev)  # KO achieved
-        reward -= 3.0 * max(0, my_faints_now  - my_faints_prev)   # lost a mon
+        # (3) Highest-eff move picked (if we can infer)
+        # Compute "best eff" from PRIOR step's available moves vs PRIOR opp active.
+        prev_opp_act = getattr(prior, "opponent_active_pokemon", None)
+        prev_my_act  = getattr(prior, "active_pokemon", None)
+        prev_opp_types = getattr(prev_opp_act, "types", []) if prev_opp_act else []
+        prev_my_types  = getattr(prev_my_act, "types", []) if prev_my_act else []
+        prev_moves = getattr(prior, "available_moves", []) or []
 
-        # (3) Crossing key HP thresholds for the opponent (first time under 50%, 25%)
-        def first_cross(prev_hp_sum, now_hp_sum, threshold_sum):
-            return 1.0 if (prev_hp_sum >= threshold_sum and now_hp_sum < threshold_sum) else 0.0
+        best_eff_prev = best_eff_against(prev_opp_types, prev_moves, prev_my_types)  # raw
+        mvtype = last_my_move_type(battle)  # try to get the actual last used move
+        if mvtype is not None and prev_opp_types:
+            used_eff = type_effectiveness_single(mvtype, prev_opp_types)
+            # reward if we were within epsilon of best (accounts for STAB nudging)
+            if used_eff >= best_eff_prev - 1e-6:
+                reward += 0.2
 
-        # Use total opponent HP sum as a proxy for "somebody got into range"
-        # (In 6v6, half = 3.0, quarter = 1.5)
-        reward += 1.0 * first_cross(opp_prev, opp_now, 3.0)   # under 50% team HP
-        reward += 1.5 * first_cross(opp_prev, opp_now, 1.5)   # under 25% team HP
+        # (4) Smart switch when efficiencies were low
+        # If I switched (active mon changed), and prior best eff was low, and now matchup improved.
+        now_my_act  = getattr(battle, "active_pokemon", None)
+        now_opp_act = getattr(battle, "opponent_active_pokemon", None)
+        switched = (prev_my_act is not None) and (now_my_act is not None) and (prev_my_act is not now_my_act)
+        if switched:
+            now_my_types  = getattr(now_my_act, "types", []) if now_my_act else []
+            now_opp_types = getattr(now_opp_act, "types", []) if now_opp_act else []
+            prev_best_norm = min(best_eff_prev / 4.0, 1.0) if best_eff_prev > 0 else 0.0
+            now_matchup = normalized_matchup_beststab(now_my_types, now_opp_types)
+            if prev_best_norm < 0.5 and now_matchup > prev_best_norm + 0.25:
+                reward += 0.3
 
-        # (4) Creating a kill threat on the active opponent (proxy >= current opp HP fraction)
-        opp_hp_now = float(getattr(opp_act, "current_hp_fraction", 1.0) or 0.0)
-        made_threat = (best_proxy_prev < opp_hp_now) and (best_proxy_now >= opp_hp_now)
-        if made_threat:
-            reward += 0.6
-
-        # (5) Speed edge changes
-        if speed_edge_prev == 0.0 and speed_edge_now == 1.0:
-            reward += 0.3
-        elif speed_edge_prev == 1.0 and speed_edge_now == 0.0:
-            reward -= 0.3
-
-        # (6) Terminal outcome
+        # (5) Terminal bonus for my Pokémon alive (no negatives)
         if battle.finished:
-            reward += 8.0 if battle.won else -8.0
+            my_alive = alive_count(battle.team)
+            reward += 0.5 * my_alive  # up to +3.0 if you 6-0
 
-        # (7) tiny step cost
-        reward -= 0.003
-
-        return float(np.clip(reward, -12.0, 12.0))
+        # Strictly positive shaping (no penalties)
+        return max(0.0, round(reward, 3))
 
 
-# ======================================
-# DO NOT EDIT THE CODE BELOW THIS LINE  #
-# ======================================
+########################################
+# DO NOT EDIT THE CODE BELOW THIS LINE #
+########################################
+
 class SingleShowdownWrapper(SingleAgentWrapper):
     """
     A wrapper class for the PokeEnvironment that simplifies the setup of single-agent
@@ -281,27 +372,32 @@ class SingleShowdownWrapper(SingleAgentWrapper):
         evaluation: bool = False,
     ):
         opponent: Player
+        unique_id = time.strftime("%H%M%S")
+
+        opponent_account = "ot" if not evaluation else "oe"
+        opponent_account = f"{opponent_account}_{unique_id}"
+
+        opponent_configuration = AccountConfiguration(opponent_account, None)
         if opponent_type == "simple":
-            opponent = SimpleHeuristicsPlayer()
+            opponent = SimpleHeuristicsPlayer(account_configuration=opponent_configuration)
         elif opponent_type == "max":
-            opponent = MaxBasePowerPlayer()
+            opponent = MaxBasePowerPlayer(account_configuration=opponent_configuration)
         elif opponent_type == "random":
-            opponent = RandomPlayer()
+            opponent = RandomPlayer(account_configuration=opponent_configuration)
         else:
             raise ValueError(f"Unknown opponent type: {opponent_type}")
 
-        account_name_one: str = "train_one" if not evaluation else "eval_one"
-        account_name_two: str = "train_two" if not evaluation else "eval_two"
+        account_name_one: str = "t1" if not evaluation else "e1"
+        account_name_two: str = "t2" if not evaluation else "e2"
 
-        account_name_one = f"{account_name_one}_{opponent_type}"
-        account_name_two = f"{account_name_two}_{opponent_type}"
+        account_name_one = f"{account_name_one}_{unique_id}"
+        account_name_two = f"{account_name_two}_{unique_id}"
 
         team = self._load_team(team_type)
-
-        battle_fomat = "gen9randombattle" if team is None else "gen9ubers"
+        battle_format = "gen9randombattle" if team is None else "gen9ubers"
 
         primary_env = ShowdownEnvironment(
-            battle_format=battle_fomat,
+            battle_format=battle_format,
             account_name_one=account_name_one,
             account_name_two=account_name_two,
             team=team,
@@ -313,7 +409,6 @@ class SingleShowdownWrapper(SingleAgentWrapper):
         bot_teams_folders = os.path.join(os.path.dirname(__file__), "teams")
 
         bot_teams = {}
-
         for team_file in os.listdir(bot_teams_folders):
             if team_file.endswith(".txt"):
                 with open(
@@ -323,5 +418,4 @@ class SingleShowdownWrapper(SingleAgentWrapper):
 
         if team_type in bot_teams:
             return bot_teams[team_type]
-
         return None
