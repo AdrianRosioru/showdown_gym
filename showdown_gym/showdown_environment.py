@@ -42,71 +42,27 @@ TYPE_CHART = {
 def _type_name(t) -> str:
     return (t.name if hasattr(t, "name") else str(t)).lower()
 
-def type_effectiveness_single(atk_type, defender_types: Iterable) -> float:
-    """Effectiveness of a single attack type against up to two defender types."""
-    if not atk_type or not defender_types:
-        return 1.0
-    row = TYPE_CHART.get(_type_name(atk_type), {})
-    mult = 1.0
-    for df in defender_types:
-        mult *= row.get(_type_name(df), 1.0)
-    return mult  # ∈ {0, 0.25, 0.5, 1, 2, 4}
-
-def normalized_matchup_beststab(attacker_types, defender_types) -> float:
-    """Best single-type (STAB-like) matchup proxy ∈ [0,1]."""
-    if not attacker_types or not defender_types:
-        return 0.5
-    best = 0.0
-    for atk in attacker_types:
-        best = max(best, type_effectiveness_single(atk, defender_types))
-    return min(best / 4.0, 1.0)
-
-def is_stab(move_type, my_types) -> bool:
-    if not move_type or not my_types:
-        return False
-    mt = _type_name(move_type)
-    return any(mt == _type_name(t) for t in my_types)
-
-def hazard_scalar(side_conditions) -> float:
-    """Tiny compressed hazard scalar ∈ [0,1] (roughly).
-    SR=0.3, Spikes=0.15/layer, TSpikes=0.2/layer, Web=0.25.
-    """
-    weights = {"stealthrock": 0.3, "spikes": 0.15, "toxicspikes": 0.2, "stickyweb": 0.25}
-    total = 0.0
-    for sc_key, sc_val in (side_conditions or {}).items():
-        name = str(getattr(sc_key, "name", sc_key)).lower()
-        if name in weights:
-            try:
-                layers = int(sc_val)
-            except Exception:
-                layers = 1 if sc_val else 0
-            total += weights[name] * layers
-    return float(np.clip(total, 0.0, 1.0))
-
 # =======================
 # Focused-30 Environment
 # =======================
 class ShowdownEnvironment(BaseShowdownEnv):
     """
-    Observation (30 dims exactly):
-      team_hp[6], opp_hp[6],                               # 12
-      matchup_my_to_opp, matchup_opp_to_my,               # 2  -> 14
-      move_eff[4], move_immune[4],                        # 8  -> 22
-      best_proxy,                                         # 1  -> 23
-      speed_edge, speed_ratio,                            # 2  -> 25
-      dmg_dealt_last, dmg_taken_last,                     # 2  -> 27
-      opp_low_hp_flag,                                    # 1  -> 28
-      my_haz_scalar, opp_haz_scalar                       # 2  -> 30
-    (No bias term to keep 30.)
+    Observation: 10-hot action hint only (length 10).
+    Exactly one index is 1:
+      0..5  -> switch targets
+      6..9  -> move indices 0..3
+    Heuristic:
+      - If our best effectiveness vs opp active < 1x, choose a valid switch that
+        maximizes normalized_matchup_beststab.
+      - Else choose the available move (0..3) that maximizes (base_power * eff * STAB).
     """
-
-    # ---------- init / info ----------
     def __init__(
         self,
         battle_format: str = "gen9randombattle",
         account_name_one: str = "train_one",
         account_name_two: str = "train_two",
         team: str | None = None,
+        low_damage_thresh: float = 0.20,  # 20% of a mon
     ):
         super().__init__(
             battle_format=battle_format,
@@ -114,18 +70,19 @@ class ShowdownEnvironment(BaseShowdownEnv):
             account_name_two=account_name_two,
             team=team,
         )
+        self.low_damage_thresh = float(low_damage_thresh)
+        self._last_action: Optional[int] = None  # for hint-alignment reward
+        self._ep_stats = {}          
+        self._norm_scale = 10.0   
+
+        self._streak_bonus = {}          # battle_key -> current bonus (starts at 0.1)
+        self._streak_bonus_init = 0.1    # reset/start value
+        self._streak_bonus_step = 0.1    # increment per consecutive correct
+        self._streak_bonus_cap = None    # e.g., 2.0 to cap; None = unlimited
     
+
+    # ---------- action space ----------
     def _get_action_size(self) -> int | None:
-        """
-        None just uses the default number of actions as laid out in process_action - 26 actions.
-
-        This defines the size of the action space for the agent - e.g. the output of the RL agent.
-
-        This should return the number of actions you wish to use if not using the default action scheme.
-        """
-        return 10  # Return None if action size is default
-
-    def process_action(self, action: np.int64) -> np.int64:
         """
         Returns the np.int64 relative to the given action.
 
@@ -145,258 +102,263 @@ class ShowdownEnvironment(BaseShowdownEnv):
         :return: The battle order ID for the given action in context of the current battle.
         :rtype: np.Int64
         """
-        #print(action)
+        return 10
+
+    def process_action(self, action: np.int64) -> np.int64:
+        try:
+            self._last_action = int(action)
+        except Exception:
+            self._last_action = None
         return action
 
-    def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
-        info = super().get_additional_info()
-        if self.battle1 is not None:
-            agent = self.possible_agents[0]
-            info[agent]["win"] = self.battle1.won
-        return info
-
-    # ---------- helpers ----------
-    @staticmethod
-    def _stage_mult(stage: int) -> float:
-        s = int(stage)
-        return (2 + s) / 2.0 if s >= 0 else 2.0 / (2 - s)
-
-    def _approx_speed(self, mon):
-        if not mon:
-            return 1.0
-        base_stats = getattr(mon, "base_stats", {}) or {}
-        base_spe = float(base_stats.get("spe", 50.0))
-        boosts = getattr(mon, "boosts", {}) or {}
-        mult = self._stage_mult(int(boosts.get("spe", 0)))
-        return base_spe * mult
-
-    @staticmethod
-    def _team_hp_list(team_dict):
-        hp = []
-        for mon in team_dict.values():
-            hp.append(float(getattr(mon, "current_hp_fraction", 1.0) or 0.0) if mon else 1.0)
-        hp = hp[:6]
-        if len(hp) < 6:
-            hp = hp + [1.0] * (6 - len(hp))
-        return hp
-
+    # ---------- helpers (reuses your type/matchup utils) ----------
     @staticmethod
     def _team_hp_sum(team_dict):
-        return sum(float(getattr(mon, "current_hp_fraction", 0.0) or 0.0) for mon in team_dict.values())
+        return sum(float(getattr(mon, "current_hp_fraction", 0.0) or 0.0)
+                   for mon in team_dict.values())
 
-    @staticmethod
-    def _best_move_features(avail_moves, opp_types, my_types):
-        """Returns (eff[4], immune[4], best_proxy[0..1]).
-        best_proxy incorporates STAB and is normalized by 150*4*1.5=900.
+    def _battle_key(self, battle: AbstractBattle) -> str:
+        return getattr(battle, "battle_tag", str(id(battle)))
+
+    def _action_hint_onehot(self, battle: AbstractBattle) -> np.ndarray:
         """
-        effs, immunes = [], []
-        best_proxy = 0.0
-        for move in (avail_moves or [])[:4]:
-            bp = float(getattr(move, "base_power", 0.0) or 0.0)
-            mtype = getattr(move, "type", None)
-            eff_raw = type_effectiveness_single(mtype, opp_types) if opp_types else 1.0
-            stab = 1.5 if is_stab(mtype, my_types) else 1.0
-            effs.append(min(eff_raw / 4.0, 1.0))
-            immunes.append(1.0 if eff_raw == 0.0 else 0.0)
-            best_proxy = max(best_proxy, (bp * eff_raw * stab) / 900.0)
-        while len(effs) < 4:
-            effs.append(0.0); immunes.append(0.0)
-        return effs, immunes, max(0.0, min(best_proxy, 1.0))
+        Minimal, robust heuristic:
+        - Score best STAY move by bp * type_effectiveness * STAB * accuracy
+        - Consider SWITCH only if best move effectiveness < 1.0 (we're resisted)
+            and a living teammate has super-effective coverage (>1.0) vs opp.
+        - Among valid switches, prefer high (my->opp) and low (opp->my).
+        Maps: 0..5 = switches, 6..9 = moves 0..3.
+        """
+        onehot = np.zeros(10, dtype=np.float32)
 
-    # ---------- observation ----------
-    def _observation_size(self) -> int:
-        return 30
+        # ----- tiny local helpers (no external deps besides TYPE_CHART/_type_name) -----
+        def eff_vs(atk_type, defender_types) -> float:
+            if not atk_type or not defender_types:
+                return 1.0
+            row = TYPE_CHART.get(_type_name(atk_type), {})
+            mult = 1.0
+            for df in defender_types:
+                mult *= row.get(_type_name(df), 1.0)
+            return float(mult)  # can be 0, 0.25, 0.5, 1, 2, 4
 
-    def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        team_hp = self._team_hp_list(battle.team)          # 6
-        opp_hp  = self._team_hp_list(battle.opponent_team) # 6
+        def best_stab_like(attacker_types, defender_types) -> float:
+            # proxy "how well does this mon's typing hit them?" in [0,4]
+            if not attacker_types or not defender_types:
+                return 1.0
+            best = 0.0
+            for atk in attacker_types:
+                best = max(best, eff_vs(atk, defender_types))
+            return best
 
+        def is_alive(mon) -> bool:
+            return bool(mon and not getattr(mon, "fainted", False) and (getattr(mon, "current_hp", 0) > 0))
+
+        def safe_accuracy(mv) -> float:
+            # 1.0 if unknown; normalize 100 -> 1.0
+            acc = None
+            entry = getattr(mv, "entry", None)
+            if isinstance(entry, dict):
+                acc = entry.get("accuracy", None)
+            if acc in (None, True):
+                try:
+                    acc = getattr(mv, "accuracy", None)
+                except Exception:
+                    acc = None
+            if acc in (None, True):
+                return 1.0
+            try:
+                acc = float(acc)
+                return acc / 100.0 if acc > 1.0 else max(0.0, min(1.0, acc))
+            except Exception:
+                return 1.0
+
+        # ----- gather state -----
         my_act  = getattr(battle, "active_pokemon", None)
         opp_act = getattr(battle, "opponent_active_pokemon", None)
         my_types  = getattr(my_act, "types", []) if my_act else []
         opp_types = getattr(opp_act, "types", []) if opp_act else []
 
-        matchup_my_to_opp = normalized_matchup_beststab(my_types, opp_types)
-        matchup_opp_to_my = normalized_matchup_beststab(opp_types, my_types)
+        # valid switches (0..5)
+        team_list = list(battle.team.values())[:6]
+        valid_switch_idxs = []
+        for i, mon in enumerate(team_list):
+            if mon is None or mon is my_act:
+                continue
+            if is_alive(mon):
+                valid_switch_idxs.append(i)
 
-        effs, immunes, best_proxy = self._best_move_features(
-            getattr(battle, "available_moves", []) or [], opp_types, my_types
-        )
+        # valid moves (6..9)
+        avail_moves = (getattr(battle, "available_moves", []) or [])[:4]
+        valid_moves = []
+        for mi, mv in enumerate(avail_moves):
+            if not bool(getattr(mv, "disabled", False)):
+                valid_moves.append((6 + mi, mv))
 
-        # damage last step
-        try:
-            prior = self._get_prior_battle(battle)
-        except AttributeError:
-            prior = None
-        my_now_sum  = self._team_hp_sum(battle.team)
-        opp_now_sum = self._team_hp_sum(battle.opponent_team)
-        if prior is None:
-            dmg_dealt_last = 0.0; dmg_taken_last = 0.0
-        else:
-            my_prev_sum  = self._team_hp_sum(prior.team)
-            opp_prev_sum = self._team_hp_sum(prior.opponent_team)
-            dmg_dealt_last = max(0.0, opp_prev_sum - opp_now_sum)
-            dmg_taken_last = max(0.0, my_prev_sum  - my_now_sum)
+        # ----- score "stay" moves -----
+        stay_best_a, stay_best_score, stay_best_eff = None, -1.0, 1.0
+        for a, mv in valid_moves:
+            bp   = float(getattr(mv, "base_power", 0.0) or 0.0)
+            mtyp = getattr(mv, "type", None)
+            eff  = eff_vs(mtyp, opp_types) if opp_types else 1.0
+            if eff == 0.0:
+                # never pick into immunity
+                continue
+            stab = 1.5 if (mtyp and any(_type_name(mtyp) == _type_name(t) for t in (my_types or []))) else 1.0
+            acc  = safe_accuracy(mv)
+            score = bp * eff * stab * acc
+            if score > stay_best_score:
+                stay_best_score = score
+                stay_best_a = a
+                stay_best_eff = eff
 
-        # speed features
-        my_speed  = self._approx_speed(my_act)
-        opp_speed = self._approx_speed(opp_act)
-        speed_edge  = 1.0 if my_speed > opp_speed else 0.0
-        speed_ratio = max(0.0, min(my_speed / max(1e-6, opp_speed), 3.0)) / 3.0
+        # If no valid moves at all, force a switch if possible (pick safest + best coverage)
+        if stay_best_a is None and valid_switch_idxs:
+            best_idx, best_tuple = None, (-1e9, -1e9)
+            for i in valid_switch_idxs:
+                mon = team_list[i]
+                new_types = getattr(mon, "types", []) or []
+                my_to_opp  = best_stab_like(new_types, opp_types)       # prefer higher
+                opp_to_new = best_stab_like(opp_types, new_types)       # prefer lower
+                cand = (my_to_opp - opp_to_new, my_to_opp)  # primary: net advantage; tie-break: our offense
+                if cand > best_tuple:
+                    best_tuple, best_idx = cand, i
+            if best_idx is not None:
+                onehot[best_idx] = 1.0
+                return onehot
+            # fallback if something weird
+            onehot[valid_switch_idxs[0]] = 1.0
+            return onehot
 
-        # low-HP flag
-        opp_low_hp_flag = 1.0 if float(getattr(opp_act, "current_hp_fraction", 1.0) or 0.0) < 0.25 else 0.0
+        # ----- decide: stay vs switch (very simple rule) -----
+        # If our best move is neutral or better, just use it.
+        if stay_best_a is not None and stay_best_eff >= 1.0:
+            onehot[stay_best_a] = 1.0
+            return onehot
 
-        # hazards compressed
-        my_haz  = hazard_scalar(getattr(battle, "side_conditions", {}))
-        opp_haz = hazard_scalar(getattr(battle, "opponent_side_conditions", {}))
+        # Otherwise, consider switching if someone has super-effective coverage and isn't a punching bag.
+        best_sw_idx, best_sw_score = None, -1e9
+        for i in valid_switch_idxs:
+            mon = team_list[i]
+            new_types = getattr(mon, "types", []) or []
+            my_to_opp  = best_stab_like(new_types, opp_types)     # 0..4 (we want >1)
+            opp_to_new = best_stab_like(opp_types, new_types)     # 0..4 (we want small)
+            # simple net advantage score
+            sw_score = (my_to_opp) - (opp_to_new)
+            if sw_score > best_sw_score:
+                best_sw_score, best_sw_idx = sw_score, i
 
-        obs = (
-            team_hp + opp_hp +
-            [matchup_my_to_opp, matchup_opp_to_my] +
-            effs + immunes +
-            [best_proxy] +
-            [speed_edge, speed_ratio] +
-            [dmg_dealt_last, dmg_taken_last] +
-            [opp_low_hp_flag] +
-            [my_haz, opp_haz]
-        )
-        vec = np.array(obs, dtype=np.float32)
-        # safety
-        if vec.size != self._observation_size():
-            if vec.size < self._observation_size():
-                vec = np.pad(vec, (0, self._observation_size() - vec.size))
-            else:
-                vec = vec[: self._observation_size()]
-        return vec
+        # If a switch clearly improves (has SE coverage and not awful defense), switch; else stay.
+        if best_sw_idx is not None:
+            # require some minimum improvement over staying being resisted
+            if (stay_best_a is None) or (best_sw_score > 0.5):  # 0.5 ~ "usually a worthwhile edge"
+                onehot[best_sw_idx] = 1.0
+                return onehot
 
+        # default: stay and use our best move (even if resisted)
+        if stay_best_a is not None:
+            onehot[stay_best_a] = 1.0
+            return onehot
+
+        # final fallback: any switch or any move
+        if valid_switch_idxs:
+            onehot[valid_switch_idxs[0]] = 1.0
+        elif valid_moves:
+            onehot[valid_moves[0][0]] = 1.0
+        return onehot
+
+    # ---------- observation ----------
+    def _observation_size(self) -> int:
+        return 10
+
+    def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
+        onehot = self._action_hint_onehot(battle).astype(np.float32)
+        #print(onehot)
+        return onehot
+
+    # ---------- reward ----------
+    # def calc_reward(self, battle: AbstractBattle) -> float:
+    #     """
+    #     Damage-first + hint-alignment:
+    #       + 3.0*dmg + 2.0*dmg^2  (dominant; dmg ∈ [0..1] per mon)
+    #       + 1.0 per KO
+    #       + 1.0 if chosen action == hinted action (based on prior state)
+    #       + 0.7 if we switched (action<=5) after a low-dmg turn (< low_damage_thresh)
+    #     """
+    #     try:
+    #         prior = self._get_prior_battle(battle)
+    #     except AttributeError:
+    #         prior = None
+
+    #     if prior is None:
+    #         return 0.0
+
+    #     reward = 0.0
+
+    #     # Dense damage
+    #     opp_prev = self._team_hp_sum(prior.opponent_team)
+    #     opp_now  = self._team_hp_sum(battle.opponent_team)
+    #     dmg_dealt = max(0.0, opp_prev - opp_now)
+    #     reward += 3.0 * dmg_dealt + 2.0 * (dmg_dealt ** 2)
+    #     if dmg_dealt >= 0.70:
+    #         reward += 0.5
+
+    #     # KO bonus
+    #     def faint_count(team_dict):
+    #         return sum(
+    #             1 for mon in team_dict.values()
+    #             if mon and (getattr(mon, "fainted", False) or getattr(mon, "current_hp", 0) <= 0)
+    #         )
+    #     opp_faints_prev = faint_count(prior.opponent_team)
+    #     opp_faints_now  = faint_count(battle.opponent_team)
+    #     if opp_faints_now > opp_faints_prev:
+    #         reward += 1.0 * (opp_faints_now - opp_faints_prev)
+
+    #     # Hint alignment (hint computed on prior state)
+    #     hint_prior = self._action_hint_onehot(prior)
+    #     hinted_idx = int(np.argmax(hint_prior)) if hint_prior.sum() > 0 else None
+    #     if hinted_idx is not None and self._last_action is not None:
+    #         if int(self._last_action) == hinted_idx:
+    #             reward += 1.0
+
+    #     # Switch after low damage
+    #     if self._last_action is not None and int(self._last_action) <= 5:
+    #         if dmg_dealt < self.low_damage_thresh:
+    #             reward += 0.7
+
+    #     # Tiny terminal positives (optional, very light)
+    #     if battle.finished:
+    #         my_now  = self._team_hp_sum(battle.team)
+    #         hp_margin = max(0.0, my_now - opp_now)
+    #         my_alive = sum(
+    #             1 for m in battle.team.values()
+    #             if m and not getattr(m, "fainted", False) and getattr(m, "current_hp", 0) > 0
+    #         )
+    #         reward += 0.10 * my_alive + 0.05 * hp_margin
+
+    #     return max(0.0, round(float(reward), 4))
+    
+    # ---------- reward ----------
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """Purely positive shaping:
-           + damage dealt (scaled & clipped)
-           + took the highest-efficiency move (ties OK; tiny extra if STAB)
-           + switched out of low-eff and improved matchup
-           + enemy KO
-           + terminal bonus for # of my Pokémon alive (+ small HP-advantage)
+        """
+        Pure hint imitation:
+        +1.0 if the chosen action equals the hint computed on the PRIOR state
+        +0.0 otherwise
         """
         try:
             prior = self._get_prior_battle(battle)
         except AttributeError:
             prior = None
 
-        # short-hands
-        def team_hp_sum(team_dict):
-            return sum(float(getattr(mon, "current_hp_fraction", 0.0) or 0.0) for mon in team_dict.values())
-
-        def faint_count(team_dict):
-            return sum(
-                1 for mon in team_dict.values()
-                if mon and (getattr(mon, "fainted", False) or getattr(mon, "current_hp", 0) <= 0)
-            )
-
-        def alive_count(team_dict):
-            return sum(
-                1 for mon in team_dict.values()
-                if mon and not getattr(mon, "fainted", False) and getattr(mon, "current_hp", 0) > 0
-            )
-
-        def best_eff_against(opp_types, moves_list, my_types) -> float:
-            best = 0.0
-            for mv in (moves_list or [])[:4]:
-                mtype = getattr(mv, "type", None)
-                eff = type_effectiveness_single(mtype, opp_types) if opp_types else 1.0
-                if is_stab(mtype, my_types):
-                    eff *= 1.01  # nudge ties toward STAB
-                best = max(best, eff)
-            return best  # raw (0..4*1.01)
-
-        def last_my_move(b: AbstractBattle):
-            # Return (type, is_stab) if we can infer; else (None, False)
-            try:
-                mv = getattr(b, "last_move", None)
-                if mv and getattr(mv, "type", None):
-                    ap = getattr(b, "active_pokemon", None)
-                    my_types = getattr(ap, "types", []) if ap else []
-                    return mv.type, is_stab(mv.type, my_types)
-            except Exception:
-                pass
-            try:
-                ap = getattr(b, "active_pokemon", None)
-                mv = getattr(ap, "last_move_used", None)
-                if mv and getattr(mv, "type", None):
-                    my_types = getattr(ap, "types", []) if ap else []
-                    return mv.type, is_stab(mv.type, my_types)
-            except Exception:
-                pass
-            return None, False
-
-        # current snapshot
-        my_now  = team_hp_sum(battle.team)
-        opp_now = team_hp_sum(battle.opponent_team)
-
         if prior is None:
-            return 0.0  # start from zero, positive-only
+            return 0.0  # no reward on the very first step
 
-        my_prev  = team_hp_sum(prior.team)
-        opp_prev = team_hp_sum(prior.opponent_team)
+        hint_prior = self._action_hint_onehot(prior)
+        hinted_idx = int(np.argmax(hint_prior)) if hint_prior.sum() > 0 else None
 
-        reward = 0.0
+        if hinted_idx is not None and self._last_action is not None:
+            return 1.0 if int(self._last_action) == hinted_idx else 0.0
 
-        # (1) Damage dealt (dense, positive, stabilized)
-        dmg_dealt = max(0.0, opp_prev - opp_now)       # ∈ [0..6]
-        reward += 0.5 * float(min(dmg_dealt, 1.0))     # cap per-step contribution at 0.5
-
-        # (2) KO bonus (spiky, positive)
-        opp_faints_prev = faint_count(prior.opponent_team)
-        opp_faints_now  = faint_count(battle.opponent_team)
-        if opp_faints_now > opp_faints_prev:
-            reward += 2.0 * (opp_faints_now - opp_faints_prev)
-
-        # (3) Highest-eff move picked (ties OK; tiny STAB boost; non-immune nudge)
-        prev_opp_act = getattr(prior, "opponent_active_pokemon", None)
-        prev_my_act  = getattr(prior, "active_pokemon", None)
-        prev_opp_types = getattr(prev_opp_act, "types", []) if prev_opp_act else []
-        prev_my_types  = getattr(prev_my_act, "types", []) if prev_my_act else []
-        prev_moves = getattr(prior, "available_moves", []) or []
-        best_eff_prev = best_eff_against(prev_opp_types, prev_moves, prev_my_types)  # raw
-
-        used_type, used_was_stab = last_my_move(battle)
-        if used_type is not None and prev_opp_types:
-            used_eff = type_effectiveness_single(used_type, prev_opp_types)
-            if used_eff >= best_eff_prev - 1e-6:
-                reward += 0.2
-                if used_was_stab:
-                    reward += 0.05
-            # tiny positive for not hitting an immunity
-            if used_eff > 0.0:
-                reward += 0.05
-
-        # (4) Smart switch when efficiencies were low (slightly gentler threshold)
-        now_my_act  = getattr(battle, "active_pokemon", None)
-        now_opp_act = getattr(battle, "opponent_active_pokemon", None)
-        switched = (prev_my_act is not None) and (now_my_act is not None) and (prev_my_act is not now_my_act)
-        if switched:
-            now_my_types  = getattr(now_my_act, "types", []) if now_my_act else []
-            now_opp_types = getattr(now_opp_act, "types", []) if now_opp_act else []
-            prev_best_norm = min(best_eff_prev / 4.0, 1.0) if best_eff_prev > 0 else 0.0
-            now_matchup = normalized_matchup_beststab(now_my_types, now_opp_types)
-            if prev_best_norm < 0.5 and now_matchup > prev_best_norm + 0.20:
-                reward += 0.3
-
-        # (5) Terminal positive bonuses
-        if battle.finished:
-            # alive bonus
-            my_alive = sum(
-                1 for m in battle.team.values()
-                if m and not getattr(m, "fainted", False) and getattr(m, "current_hp", 0) > 0
-            )
-            reward += 0.5 * my_alive  # up to +3.0
-
-            # slight HP-advantage bonus (positive-only)
-            hp_margin = max(0.0, my_now - opp_now)     # only reward if ahead
-            reward += 0.2 * float(hp_margin)           # up to +1.2 if you finish very healthy
-
-        # strictly non-negative and stable decimals
-        return max(0.0, round(reward, 3))
+        return 0.0
 
 
 ########################################
