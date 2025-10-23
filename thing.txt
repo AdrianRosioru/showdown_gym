@@ -1,0 +1,313 @@
+    def _action_hint_onehot(self, battle: AbstractBattle) -> np.ndarray:
+        """
+        Minimal, robust heuristic (immunity-aware + risk-aware + danger pivots):
+        - Score moves: bp * eff * STAB * acc * risk_mult (eff=0 when ability/item blocks).
+        - Risk: downweight low-accuracy and 2-turn/recharge moves; skip OHKO moves.
+        - Finisher (<=15% HP): pick most reliable; only if opp_to_me < 2x OR finisher has priority,
+        AND finisher acc >= min_move_acc (unless priority).
+        - Swap if: attacks are resisted (<1x) OR immune/no-move OR just low damage,
+        and a teammate offers clearly better matchup (SE >1x, or neutral back with <=1x incoming,
+        or simply cuts a lot of incoming damage).
+        - Switch tiebreaks: (my->opp - opp->me, my->opp, HP).
+        Maps: 0..5 = switches, 6..9 = moves 0..3.
+        """
+        onehot = np.zeros(10, dtype=np.float32)
+
+        # ----- helpers -----
+        def eff_vs(atk_type, defender_types) -> float:
+            if not atk_type or not defender_types:
+                return 1.0
+            row = TYPE_CHART.get(_type_name(atk_type), {})
+            mult = 1.0
+            for df in defender_types:
+                mult *= row.get(_type_name(df), 1.0)
+            return float(mult)
+
+        def blocks_type(defender, atk_type) -> bool:
+            if not defender or not atk_type:
+                return False
+            t = _type_name(atk_type)
+            item = (getattr(defender, "item", None) or "").strip().lower()
+            if item == "airballoon" and t == "ground":
+                return True
+            ab = (getattr(defender, "ability", None) or "").strip().lower()
+            if ab == "levitate" and t == "ground":
+                return True
+            if ab in ("flashfire",) and t == "fire":
+                return True
+            if ab in ("voltabsorb", "lightningrod", "motordrive") and t == "electric":
+                return True
+            if ab in ("waterabsorb", "stormdrain", "dryskin") and t == "water":
+                return True
+            if ab in ("sapsipper",) and t == "grass":
+                return True
+            if ab == "wonderguard":
+                eff = eff_vs(atk_type, getattr(defender, "types", []) or [])
+                return eff <= 1.0
+            return False
+
+        def best_stab_like(attacker_types, defender_types) -> float:
+            if not attacker_types or not defender_types:
+                return 1.0
+            best = 0.0
+            for atk in attacker_types:
+                best = max(best, eff_vs(atk, defender_types))
+            return best
+
+        def best_stab_like_passive(attacker_types, defender) -> float:
+            if not attacker_types or not defender:
+                return 1.0
+            dtypes = getattr(defender, "types", []) or []
+            best = 0.0
+            for atk in attacker_types:
+                eff = 0.0 if blocks_type(defender, atk) else eff_vs(atk, dtypes)
+                best = max(best, eff)
+            return best
+
+        def is_alive(mon) -> bool:
+            return bool(mon and not getattr(mon, "fainted", False) and (getattr(mon, "current_hp", 0) > 0))
+
+        def safe_accuracy(mv) -> float:
+            acc = None
+            entry = getattr(mv, "entry", None)
+            if isinstance(entry, dict):
+                acc = entry.get("accuracy", None)
+            if acc in (None, True):
+                try:
+                    acc = getattr(mv, "accuracy", None)
+                except Exception:
+                    acc = None
+            if acc in (None, True):
+                return 1.0
+            try:
+                acc = float(acc)
+                return acc / 100.0 if acc > 1.0 else max(0.0, min(1.0, acc))
+            except Exception:
+                return 1.0
+
+        def safe_priority(mv) -> int:
+            pr = 0
+            try:
+                pr = int(getattr(mv, "priority", 0) or 0)
+            except Exception:
+                pr = 0
+            if pr == 0:
+                entry = getattr(mv, "entry", None)
+                if isinstance(entry, dict):
+                    try:
+                        pr = int(entry.get("priority", 0) or 0)
+                    except Exception:
+                        pr = 0
+            return pr
+
+        def hp_ratio(poke) -> float:
+            try:
+                cur = float(getattr(poke, "current_hp", None) or 0.0)
+                mx  = getattr(poke, "max_hp", None)
+                if mx is None:
+                    stats = getattr(poke, "stats", {}) or {}
+                    mx = stats.get("hp", None)
+                mx = float(mx) if mx not in (None, 0) else None
+                if not mx:
+                    return 1.0
+                return max(0.0, min(1.0, cur / mx))
+            except Exception:
+                return 1.0
+
+        # ----- state -----
+        my_act  = getattr(battle, "active_pokemon", None)
+        opp_act = getattr(battle, "opponent_active_pokemon", None)
+        my_types  = getattr(my_act, "types", []) if my_act else []
+        opp_types = getattr(opp_act, "types", []) if opp_act else []
+
+        # opponent threat vs current mon (passive-aware)
+        opp_to_me = best_stab_like_passive(opp_types, my_act)
+
+        # action sets
+        team_list = list(battle.team.values())[:6]
+        valid_switch_idxs = [i for i, mon in enumerate(team_list) if (mon is not None and mon is not my_act and is_alive(mon))]
+        avail_moves = (getattr(battle, "available_moves", []) or [])[:4]
+        valid_moves = [(6 + mi, mv) for mi, mv in enumerate(avail_moves) if not bool(getattr(mv, "disabled", False))]
+
+        # thresholds / knobs (configurable without touching __init__)
+        low_score_thresh = float(getattr(self, "low_move_score_thresh", 60.0))   # "just low damage"
+        resisted_eff_thresh = float(getattr(self, "resisted_eff_thresh", 1.0))   # <1.0 is resisted
+        finisher_hp_thresh = float(getattr(self, "finisher_hp_thresh", 0.15))
+        # risk knobs
+        min_move_acc = float(getattr(self, "min_move_acc", 0.80))                # below this is "risky"
+        risk_mult_lowacc = float(getattr(self, "risk_mult_lowacc", 0.5))         # downweight for low-acc moves
+        risk_mult_chargetype = float(getattr(self, "risk_mult_chargetype", 0.6)) # downweight for 2-turn/recharge
+
+        # ----- score moves (risk-aware) -----
+        stay_best_a, stay_best_score, stay_best_eff = None, -1.0, 1.0
+        finisher_choice, finisher_prio, finisher_acc = None, 0, 1.0
+        finisher_key = (-1.0, -999, -1.0, -1.0, -1.0)  # (acc, prio, eff, stab, bp)
+
+        any_nonimmune = False
+        for a, mv in valid_moves:
+            entry = getattr(mv, "entry", None)
+            safe_name = str(getattr(mv, "id", getattr(mv, "name", ""))).lower()
+
+            # Identify failure-prone patterns
+            is_ohko = safe_name in ("sheercold", "fissure", "horndrill", "guillotine")
+            if (isinstance(entry, dict) and entry.get("ohko", False)):
+                is_ohko = True
+            two_turn = isinstance(entry, dict) and bool(
+                entry.get("twoTurnMove") or entry.get("two_turn") or entry.get("chargingTurn")
+            )
+            # SAFE recharge detection
+            recharge = False
+            if isinstance(entry, dict):
+                # direct boolean flag
+                if bool(entry.get("recharge")):
+                    recharge = True
+                else:
+                    # sometimes present under a nested "self" section
+                    self_sec = entry.get("self")
+                    if isinstance(self_sec, dict) and self_sec.get("volatileStatus") == "mustrecharge":
+                        recharge = True
+
+
+            # Base components
+            bp   = float(getattr(mv, "base_power", 0.0) or 0.0)
+            mtyp = getattr(mv, "type", None)
+            eff  = eff_vs(mtyp, opp_types) if opp_types else 1.0
+            if opp_act and blocks_type(opp_act, mtyp):
+                eff = 0.0
+            if eff == 0.0:
+                continue  # never pick into immunity
+            any_nonimmune = True
+
+            stab = 1.5 if (mtyp and any(_type_name(mtyp) == _type_name(t) for t in (my_types or []))) else 1.0
+            acc  = safe_accuracy(mv)
+            prio = safe_priority(mv)
+
+            # Hard skip OHKO cheese
+            if is_ohko:
+                continue
+
+            # Risk shaping
+            risk_mult = 1.0
+            if acc < min_move_acc:
+                risk_mult *= risk_mult_lowacc
+            if two_turn or recharge:
+                # harsher if we're under SE threat
+                risk_mult *= (risk_mult_chargetype * (0.7 if opp_to_me >= 2.0 else 1.0))
+
+            score = bp * eff * stab * acc * risk_mult
+
+            if score > stay_best_score:
+                stay_best_score = score
+                stay_best_a = a
+                stay_best_eff = eff
+
+            # Finisher candidates only for actually damaging moves
+            if bp > 0.0:
+                key = (acc, prio, eff, stab, bp)
+                if key > finisher_key:
+                    finisher_key = key
+                    finisher_choice = a
+                    finisher_prio = prio
+                    finisher_acc  = acc
+
+        immune_or_no_moves = (stay_best_a is None) or (not any_nonimmune)
+        resisted = (stay_best_a is not None) and (stay_best_eff < resisted_eff_thresh)
+        low_damage = (stay_best_a is not None) and (stay_best_score < low_score_thresh)
+
+        # ----- FINISHER (safer) -----
+        opp_is_low = bool(opp_act) and (hp_ratio(opp_act) <= finisher_hp_thresh)
+        if opp_is_low and finisher_choice is not None:
+            # Only finish if (not under heavy SE) OR we have priority,
+            # AND the finisher is accurate enough (or has priority).
+            if ((opp_to_me < 2.0) or (finisher_prio > 0)) and (finisher_acc >= min_move_acc or finisher_prio > 0):
+                onehot[finisher_choice] = 1.0
+                return onehot
+
+        # ----- no valid damaging move -> pick best switch now -----
+        if immune_or_no_moves and valid_switch_idxs:
+            best_idx, best_tuple = None, (-1e9, -1e9, -1e9)
+            for i in valid_switch_idxs:
+                mon = team_list[i]
+                my_to_opp  = best_stab_like_passive(getattr(mon, "types", []) or [], opp_act)
+                opp_to_new = best_stab_like_passive(opp_types, mon)
+                hpw = hp_ratio(mon)
+                cand = (my_to_opp - opp_to_new, my_to_opp, hpw)
+                if cand > best_tuple:
+                    best_tuple, best_idx = cand, i
+            if best_idx is not None:
+                onehot[best_idx] = 1.0
+                return onehot
+
+        # ======= STAY vs SWAP =======
+
+        # If neutral-or-better and not in big danger, stay (unless low damage triggers pivot below)
+        if (stay_best_a is not None) and (stay_best_eff >= 1.0) and not (opp_to_me >= 2.0):
+            if not low_damage:
+                onehot[stay_best_a] = 1.0
+                return onehot
+
+        # Build best switch candidate (usable for all triggers)
+        best_sw_idx, best_sw_score = None, -1e9
+        best_sw_my_to_opp, best_sw_opp_to_new = 0.0, 99.0
+        for i in valid_switch_idxs:
+            mon = team_list[i]
+            my_to_opp  = best_stab_like_passive(getattr(mon, "types", []) or [], opp_act)
+            opp_to_new = best_stab_like_passive(opp_types, mon)
+
+            # allow defensive pivots that shave a lot of incoming (e.g., 4x -> 2x)
+            danger_reduction = opp_to_me - opp_to_new
+            good_offense = (my_to_opp > 1.0) or (my_to_opp >= 1.0 and opp_to_new <= 1.0) or (danger_reduction >= 1.0)
+            if not good_offense:
+                continue
+
+            sw_score = (my_to_opp) - (opp_to_new)
+            sw_score += 0.05 * hp_ratio(mon)  # tiny HP tiebreak
+            if sw_score > best_sw_score:
+                best_sw_score = sw_score
+                best_sw_idx = i
+                best_sw_my_to_opp, best_sw_opp_to_new = my_to_opp, opp_to_new
+
+        # Decide if we should actually swap
+        should_consider_swap = immune_or_no_moves or resisted or low_damage or (opp_to_me >= 2.0)
+
+        if best_sw_idx is not None and should_consider_swap:
+            # scale threshold by how dangerous current spot is
+            if stay_best_a is None or immune_or_no_moves:
+                need = 0.0
+            elif resisted:
+                need = 0.25 if stay_best_eff < 0.5 else 0.5
+            elif low_damage:
+                need = 0.25
+            else:
+                # danger pivot from neutral:
+                # 2x -> 0.5, 3x -> 0.25, 4x -> 0.0
+                need = max(0.0, 0.5 - 0.25 * (opp_to_me - 2.0))
+            if best_sw_score >= need:
+                onehot[best_sw_idx] = 1.0
+                return onehot
+
+        # OPTIONAL: auto-pivot when quadruple-weak (ultra-conservative)
+        if opp_to_me >= 4.0 and valid_switch_idxs:
+            best_idx, best_tuple = None, (99.0, -1.0)  # (incoming, our_offense)
+            for i in valid_switch_idxs:
+                mon = team_list[i]
+                my_to_opp  = best_stab_like_passive(getattr(mon, "types", []) or [], opp_act)
+                opp_to_new = best_stab_like_passive(opp_types, mon)
+                cand = (opp_to_new, my_to_opp)
+                if cand < best_tuple:
+                    best_tuple, best_idx = cand, i
+            if best_idx is not None:
+                onehot[best_idx] = 1.0
+                return onehot
+
+        # default: stay and use our best move
+        if stay_best_a is not None:
+            onehot[stay_best_a] = 1.0
+            return onehot
+
+        # last resort
+        if valid_switch_idxs:
+            onehot[valid_switch_idxs[0]] = 1.0
+        elif valid_moves:
+            onehot[valid_moves[0][0]] = 1.0
+        return onehot
